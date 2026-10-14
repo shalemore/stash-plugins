@@ -1,0 +1,94 @@
+name: Extended Attributes
+description: Enforce single-subtype attribute schemas and path-based defaults
+version: 0.2.1
+
+url: https://github.com/shalemore/stash-plugins
+
+exec:
+  - python3
+  - "{pluginDir}/main.py"
+
+interface: raw
+errLog: info
+
+tasks:
+  - name: Full Rebuild
+    description: Rebuild subtype attributes for galleries groups images scenes and performers
+    defaultArgs:
+      dry_run: false
+  - name: Dry Run
+    description: Preview expected changes without updating data
+    defaultArgs:
+      dry_run: true
+
+hooks:
+  - name: Gallery Create
+    description: Rebuild subtype attributes after gallery creation
+    triggeredBy:
+      - Gallery.Create.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: gallery
+  - name: Gallery Update
+    description: Rebuild subtype attributes after gallery updates
+    triggeredBy:
+      - Gallery.Update.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: gallery
+  - name: Image Create
+    description: Rebuild subtype attributes after image creation
+    triggeredBy:
+      - Image.Create.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: image
+  - name: Group Create
+    description: Rebuild subtype attributes after group creation
+    triggeredBy:
+      - Group.Create.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: group
+  - name: Group Update
+    description: Rebuild subtype attributes after group updates
+    triggeredBy:
+      - Group.Update.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: group
+  - name: Image Update
+    description: Rebuild subtype attributes after image updates
+    triggeredBy:
+      - Image.Update.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: image
+  - name: Scene Create
+    description: Rebuild subtype attributes after scene creation
+    triggeredBy:
+      - Scene.Create.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: scene
+  - name: Scene Update
+    description: Rebuild subtype attributes after scene updates
+    triggeredBy:
+      - Scene.Update.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: scene
+  - name: Performer Create
+    description: Rebuild subtype attributes after performer creation
+    triggeredBy:
+      - Performer.Create.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: performer
+  - name: Performer Update
+    description: Rebuild subtype attributes after performer updates
+    triggeredBy:
+      - Performer.Update.Post
+    defaultArgs:
+      dry_run: false
+      entity_type: performer
