@@ -1,0 +1,84 @@
+name: Release
+
+# Publishes the plugin index to GitHub Pages when a plugin has a version that is not tagged yet,
+# then tags each new version. To release a plugin, bump `version` in plugins/<id>/<id>.yml.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      plugins: ${{ steps.plan.outputs.plugins }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked
+      - id: plan
+        run: uv run python scripts/release_plan.py | tee -a "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}index.yml
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked
+      - run: uv run python scripts/build_site.py _site
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # Tagging comes last: if the deployment fails, the next run still sees the versions as unreleased.
+  tag:
+    needs: [plan, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked
+      - run: uv run python scripts/build_site.py _site
+
+      # The notes list the commits that touched the plugin since its previous release.
+      - name: Tag and create the GitHub releases
+        run: |
+          for plugin in $(jq -c '.[]' <<< "$PLUGINS"); do
+            id=$(jq -r .id <<< "$plugin")
+            version=$(jq -r .version <<< "$plugin")
+            previous=$(git describe --tags --abbrev=0 --match "$id-v*" 2>/dev/null || true)
+            notes=$(git log ${previous:+"$previous..HEAD"} --no-merges --invert-grep --grep='^chore(release)' --pretty='- %s (%h)' -- "plugins/$id")
+            gh release create "$id-v$version" "_site/$id.zip" --target "$GITHUB_SHA" --title "$id $version" --notes "$notes"
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGINS: ${{ needs.plan.outputs.plugins }}
