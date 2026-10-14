@@ -9,6 +9,7 @@ uv run ruff check            # lint
 uv run basedpyright          # types
 uv run pytest
 uv run python scripts/build_site.py   # builds the plugin index into _site
+uv run python scripts/download_schema.py [tag]   # downloads the Stash GraphQL schema into schema/
 ```
 
 ## Releasing
