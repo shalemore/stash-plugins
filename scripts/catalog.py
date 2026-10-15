@@ -34,8 +34,9 @@ class Plugin:
 
     @property
     def sources(self) -> list[Path]:
-        """What the plugin's zip is built from."""
-        return [self.directory]
+        """What the plugin's zip is built from: its directory and the modules every plugin
+        imports, which the build copies into each plugin."""
+        return [self.root / "shared", self.directory]
 
 
 def load_plugin(directory: Path) -> Plugin:

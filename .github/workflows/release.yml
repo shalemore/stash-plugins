@@ -69,14 +69,15 @@ jobs:
       - run: uv sync --locked
       - run: uv run python scripts/build_site.py _site
 
-      # The notes list the commits that touched the plugin since its previous release.
+      # The notes list the commits that touched the plugin or the shared modules since its previous
+      # release.
       - name: Tag and create the GitHub releases
         run: |
           for plugin in $(jq -c '.[]' <<< "$PLUGINS"); do
             id=$(jq -r .id <<< "$plugin")
             version=$(jq -r .version <<< "$plugin")
             previous=$(git describe --tags --abbrev=0 --match "$id-v*" 2>/dev/null || true)
-            notes=$(git log ${previous:+"$previous..HEAD"} --no-merges --invert-grep --grep='^chore(release)' --pretty='- %s (%h)' -- "plugins/$id")
+            notes=$(git log ${previous:+"$previous..HEAD"} --no-merges --invert-grep --grep='^chore(release)' --pretty='- %s (%h)' -- "plugins/$id" shared)
             gh release create "$id-v$version" "_site/$id.zip" --target "$GITHUB_SHA" --title "$id $version" --notes "$notes"
           done
         env:

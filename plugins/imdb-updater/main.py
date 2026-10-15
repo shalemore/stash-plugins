@@ -1,23 +1,18 @@
-import json
 import re
 import sys
 import tempfile
 from collections import defaultdict
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
-from urllib.error import HTTPError, URLError
+from typing import NamedTuple
 
 from imdb_episodes import Episode, load_episodes
-from plugin_runtime import (
-    emit_info,
-    emit_progress,
-    emit_warn,
-    exclusive_lock,
-    load_plugin_input,
-    read_api_key,
-)
 from stash_api import (
-    StashClient,
+    TIMEOUT,
+    Scene,
+    Subtype,
     create_group,
     find_group_subtypes,
     find_groups,
@@ -25,6 +20,17 @@ from stash_api import (
     scrape_group_url,
     scrape_scene_url,
     update_scene,
+)
+from stash_plugin import (
+    FAILURES,
+    PluginInput,
+    Progress,
+    StashClient,
+    as_bool,
+    as_list,
+    emit_info,
+    emit_warn,
+    run_plugin,
 )
 
 IMDB_ID_RE = re.compile(r"\[imdbid=(tt\d+)\]", re.IGNORECASE)
@@ -46,27 +52,40 @@ SCENE_SCRAPED_FIELDS = {
     "image": "cover_image",
 }
 
-FAILURES = (HTTPError, URLError, TimeoutError, RuntimeError, ValueError, KeyError)
-
 
 def imdb_url(imdb_id: str) -> str:
     return f"https://www.imdb.com/title/{imdb_id}/"
 
 
-def resolve_graphql_url(server_connection: dict[str, Any]) -> str:
-    explicit_url = str(server_connection.get("GraphQLURL") or "").strip()
-    if explicit_url:
-        return explicit_url
-    scheme = server_connection.get("Scheme") or "http"
-    host = server_connection.get("Host") or "127.0.0.1"
-    if host == "0.0.0.0":
-        host = "127.0.0.1"
-    port = server_connection.get("Port") or 9999
-    return f"{scheme}://{host}:{port}/graphql"
+@contextmanager
+def exclusive_lock(lock_path: Path) -> Generator[None, None, None]:
+    """Let only one instance run at a time.
+
+    A scan is multi-threaded, so several files of one title fire the hook concurrently. Without this
+    lock they would all find that the group does not exist yet and each create one. The lock is
+    released when the process exits, so it never goes stale.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # LK_LOCK gives up after about 10 seconds, so keep retrying until it succeeds.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    continue
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
 
 
 class SceneEntry(NamedTuple):
-    scene: dict[str, Any]
+    scene: Scene
     folder: str
     file_name: str
     episode_key: tuple[int, int] | None
@@ -75,13 +94,14 @@ class SceneEntry(NamedTuple):
 def parse_episode(file_name: str) -> tuple[int, int] | None:
     if match := SEASON_EPISODES_RE.search(file_name):
         # Multi-episode files (e.g. S01E23-E24) are treated as the last episode.
-        return int(match[1]), int(EPISODE_NUMBER_RE.findall(match[2])[-1])
+        *_, last = EPISODE_NUMBER_RE.finditer(match[2])
+        return int(match[1]), int(last[1])
     if match := SEASON_X_EPISODE_RE.search(file_name):
         return int(match[1]), int(match[3] or match[2])
     return None
 
 
-def find_imdb_entry(scene: dict[str, Any]) -> tuple[str, SceneEntry] | None:
+def find_imdb_entry(scene: Scene) -> tuple[str, SceneEntry] | None:
     # The folder of a title carries the IMDb ID: <anything>/<title> [imdbid=ttXXXX]/...
     for file in scene["files"]:
         *parts, file_name = re.split(r"[\\/]", file["path"])
@@ -91,7 +111,7 @@ def find_imdb_entry(scene: dict[str, Any]) -> tuple[str, SceneEntry] | None:
     return None
 
 
-def group_entries_by_imdb_id(scenes: list[dict[str, Any]]) -> dict[str, list[SceneEntry]]:
+def group_entries_by_imdb_id(scenes: list[Scene]) -> dict[str, list[SceneEntry]]:
     entries_by_imdb_id: defaultdict[str, list[SceneEntry]] = defaultdict(list)
     for scene in scenes:
         if found := find_imdb_entry(scene):
@@ -104,7 +124,7 @@ def fallback_group_name(folder: str) -> str:
     return re.sub(r"\s*\(\d{4}\)$", "", name).strip()
 
 
-def find_type_tag(client: StashClient) -> dict[str, Any] | None:
+def find_type_tag(client: StashClient) -> Subtype | None:
     """The subtype tag under `__GROUP__` that is named or aliased `GROUP_TYPE_TAG`, if any."""
     wanted = GROUP_TYPE_TAG.casefold()
     return next(
@@ -140,14 +160,16 @@ def ensure_entry_group(
         )
         return None
 
-    scraped: dict[str, Any] = {}
+    scraped: dict[str, object] = {}
     try:
         scraped = scrape_group_url(client, url) or {}
     except FAILURES as exc:
         emit_warn(f"Group scrape failed, creating it from the folder name: {url} ({exc})")
 
-    group_input = {field: scraped[field] for field in GROUP_SCRAPED_FIELDS if scraped.get(field)}
-    group_input.setdefault("name", fallback_group_name(entry.folder))
+    group_input: dict[str, object] = {
+        "name": fallback_group_name(entry.folder),
+        **{key: scraped[key] for key in GROUP_SCRAPED_FIELDS if scraped.get(key)},
+    }
     group_input["urls"] = scraped.get("urls") or [url]
     if type_tag:
         group_input["tag_ids"] = [type_tag["id"]]
@@ -158,13 +180,13 @@ def ensure_entry_group(
 
 def build_scene_update(
     client: StashClient,
-    scene: dict[str, Any],
+    scene: Scene,
     group_id: str,
     scene_index: int | None,
     episode: Episode | None,
     dry_run: bool,
-) -> dict[str, Any]:
-    update: dict[str, Any] = {"id": scene["id"]}
+) -> dict[str, object]:
+    update: dict[str, object] = {"id": scene["id"]}
 
     current_indexes = {item["group"]["id"]: item["scene_index"] for item in scene["groups"]}
     if group_id not in current_indexes or current_indexes[group_id] != scene_index:
@@ -187,12 +209,19 @@ def build_scene_update(
                     if scraped.get(source)
                 }
             )
-            urls = [url, *(scraped.get("urls") or []), *scene["urls"]]
+            urls = [url, *map(str, as_list(scraped.get("urls"))), *scene["urls"]]
         unique_urls = list(dict.fromkeys(urls))
         if unique_urls != scene["urls"]:
             update["urls"] = unique_urls
 
     return update
+
+
+@dataclass
+class SeriesResult:
+    updated: int = 0
+    skipped: int = 0
+    failed: list[dict[str, str]] = field(default_factory=list)
 
 
 def sync_series(
@@ -201,8 +230,8 @@ def sync_series(
     entries: list[SceneEntry],
     episodes: list[Episode],
     dry_run: bool,
-    progress: dict[str, int],
-) -> dict[str, Any]:
+    progress: Progress,
+) -> SeriesResult:
     group_id = ensure_entry_group(client, imdb_id, entries[0], dry_run)
 
     episode_by_key = {(item.season, item.episode): item for item in episodes}
@@ -216,14 +245,13 @@ def sync_series(
             start=1,
         )
     }
-    result: dict[str, Any] = {"updated": 0, "skipped": 0, "failed": []}
+    result = SeriesResult()
 
     for entry in entries:
         scene, file_name, key = entry.scene, entry.file_name, entry.episode_key
-        progress["done"] += 1
-        emit_progress(progress["done"] / progress["total"])
+        progress.step()
         if group_id is None:
-            result["skipped"] += 1
+            result.skipped += 1
             continue
 
         if key and key not in episode_by_key:
@@ -238,47 +266,39 @@ def sync_series(
                 dry_run,
             )
             if len(update) == 1:
-                result["skipped"] += 1
+                result.skipped += 1
                 continue
             if not dry_run:
                 update_scene(client, update)
-            result["updated"] += 1
+            result.updated += 1
             emit_info(
                 f"{'Would update' if dry_run else 'Updated'} scene {scene['id']}: {file_name}"
             )
         except FAILURES as exc:
-            result["failed"].append({"id": scene["id"], "path": file_name, "reason": str(exc)})
+            result.failed.append({"id": scene["id"], "path": file_name, "reason": str(exc)})
             emit_warn(f"Failed scene {scene['id']}: {file_name} ({exc})")
 
     return result
 
 
-def run() -> dict[str, Any]:
-    plugin_input = load_plugin_input()
-    server_connection = plugin_input.get("server_connection") or {}
-    args = plugin_input.get("args") or {}
-    hook_context = args.get("hookContext")
-    dry_run = str(args.get("dry_run", "false")).strip().lower() == "true"
+def run(plugin_input: PluginInput) -> object:
+    hook = plugin_input.hook
+    dry_run = as_bool(plugin_input.args.get("dry_run"), False)
+    client = StashClient.connect(plugin_input, timeout=TIMEOUT)
 
-    client = StashClient(
-        graphql_url=resolve_graphql_url(server_connection),
-        api_key=read_api_key(server_connection.get("Dir")),
-        session_cookie=server_connection.get("SessionCookie"),
-    )
-
-    scene_ids = [str(hook_context["id"])] if hook_context and "id" in hook_context else None
+    scene_ids = [hook.id] if hook and hook.id is not None else None
     entries_by_imdb_id = group_entries_by_imdb_id(find_scenes(client, scene_ids))
     if not entries_by_imdb_id:
-        return {"error": None, "output": {"dry_run": dry_run, "series": {}}}
+        return {"dry_run": dry_run, "series": {}}
 
-    cache_path = Path(server_connection.get("Dir") or tempfile.gettempdir()) / "cache"
+    cache_path = Path(plugin_input.config_dir or tempfile.gettempdir()) / "cache"
     # Scenes outside IMDb folders returned above and never queue. The rest run one at a time so
     # concurrent hooks cannot create duplicate groups.
     with exclusive_lock(cache_path / "imdb-updater.lock"):
         if scene_ids:
             # A new scene can change the scene_index of the other scenes of the same title, so the
-            # whole title is processed.
-            # Read again inside the lock to see what the previous instance just created.
+            # whole title is processed. Read again inside the lock to see what the previous
+            # instance just created.
             entries_by_imdb_id = group_entries_by_imdb_id(
                 find_scenes(client, imdb_ids=list(entries_by_imdb_id))
             )
@@ -290,27 +310,16 @@ def run() -> dict[str, Any]:
         }
         episodes = load_episodes(cache_path / "imdb-updater-episodes.json", tv_series_ids)
 
-        total = sum(len(entries) for entries in entries_by_imdb_id.values())
-        progress = {"done": 0, "total": total}
-        emit_info(f"Processing {total} scenes of {len(entries_by_imdb_id)} IMDb entries")
+        progress = Progress(total=sum(map(len, entries_by_imdb_id.values())))
+        emit_info(f"Processing {progress.total} scenes of {len(entries_by_imdb_id)} IMDb entries")
         output = {
-            imdb_id: sync_series(
-                client, imdb_id, entries, episodes.get(imdb_id, []), dry_run, progress
+            imdb_id: asdict(
+                sync_series(client, imdb_id, entries, episodes.get(imdb_id, []), dry_run, progress)
             )
             for imdb_id, entries in entries_by_imdb_id.items()
         }
-    return {"error": None, "output": {"dry_run": dry_run, "series": output}}
-
-
-def main() -> None:
-    try:
-        result = run()
-    except FAILURES as exc:
-        print(json.dumps({"error": str(exc), "output": None}, ensure_ascii=False))
-        sys.exit(1)
-
-    print(json.dumps(result, ensure_ascii=False))
+    return {"dry_run": dry_run, "series": output}
 
 
 if __name__ == "__main__":
-    main()
+    run_plugin(run)

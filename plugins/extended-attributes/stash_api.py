@@ -1,61 +1,93 @@
-import json
 import re
 from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urlsplit
+from typing import Literal, NotRequired, TypedDict
 
-from plugin_runtime import build_cookie_header
+from stash_plugin import Operation, StashClient
 
-
-@dataclass
-class StashClient:
-    graphql_url: str
-    api_key: str | None
-    session_cookie: dict[str, Any] | None
-
-    def request(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        # Deferred import: urllib.request costs ~100ms at startup, and skipped hooks never need it.
-        from urllib.request import Request, urlopen
-
-        payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
-        parsed_url = urlsplit(self.graphql_url)
-        origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/graphql-response+json, application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/135.0.0.0 Safari/537.36"
-            ),
-            "Origin": origin,
-            "Referer": f"{origin}/",
-        }
-        if self.api_key:
-            headers["ApiKey"] = self.api_key
-
-        cookie_header = build_cookie_header(self.session_cookie)
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-
-        req = Request(self.graphql_url, data=payload, headers=headers, method="POST")
-        with urlopen(req, timeout=60) as response:
-            data = json.load(response)
-
-        if data.get("errors"):
-            raise RuntimeError(json.dumps(data["errors"], ensure_ascii=False))
-
-        return data["data"]
-
-
-def _normalize_item(item: dict[str, Any], paths: list[str | None] | None = None) -> dict[str, Any]:
-    normalized = dict(item)
-    normalized["tag_ids"] = [str(tag["id"]) for tag in item.get("tags") or []]
-    normalized["paths"] = [path for path in paths or [] if path]
-    return normalized
-
+EntityType = Literal["gallery", "group", "image", "scene", "performer"]
 
 TAG_TREE_DEPTH = 5
+
+
+class TagTree(TypedDict):
+    id: str
+    name: str
+    aliases: list[str]
+    custom_fields: object
+    # Absent on the deepest level of the queried tree.
+    children: NotRequired[list["TagTree"]]
+
+
+class _Tags(TypedDict):
+    tags: list[TagTree]
+
+
+class _FindTags(TypedDict):
+    findTags: _Tags
+
+
+class _TagRef(TypedDict):
+    id: str
+
+
+class _File(TypedDict):
+    # Absent on visual files that are not images.
+    path: NotRequired[str]
+
+
+class _RawItem(TypedDict):
+    id: str
+    tags: list[_TagRef]
+    folder: NotRequired[_File | None]
+    files: NotRequired[list[_File]]
+    visual_files: NotRequired[list[_File]]
+
+
+@dataclass(frozen=True)
+class Item:
+    id: str
+    tag_ids: list[str]
+    paths: list[str]
+
+
+_FindItems = dict[str, dict[str, list[_RawItem]]]
+
+
+@dataclass(frozen=True)
+class Entity:
+    find_field: str
+    results_field: str
+    find: Operation[_FindItems]
+    bulk_update: Operation[object]
+
+
+def _entity(name: str, plural: str, path_fields: str = "") -> Entity:
+    find_field = f"find{plural.title()}"
+    return Entity(
+        find_field=find_field,
+        results_field=plural,
+        find=Operation[_FindItems](f"""
+            query Find{plural.title()}($filter: FindFilterType, $ids: [ID!]) {{
+              {find_field}(filter: $filter, ids: $ids) {{
+                {plural} {{ id {path_fields} tags {{ id }} }}
+              }}
+            }}
+        """),
+        bulk_update=Operation[object](f"""
+            mutation Bulk{name}Update($input: Bulk{name}UpdateInput!) {{
+              bulk{name}Update(input: $input) {{ id }}
+            }}
+        """),
+    )
+
+
+ENTITIES: dict[EntityType, Entity] = {
+    "gallery": _entity("Gallery", "galleries", "folder { path } files { path }"),
+    "group": _entity("Group", "groups"),
+    "image": _entity("Image", "images", "visual_files { ... on ImageFile { path } }"),
+    "scene": _entity("Scene", "scenes", "files { path }"),
+    "performer": _entity("Performer", "performers"),
+}
 
 
 def _tag_tree_fields(depth: int) -> str:
@@ -65,17 +97,18 @@ def _tag_tree_fields(depth: int) -> str:
     return f"{fields} children {{ {_tag_tree_fields(depth - 1)} }}"
 
 
-def find_root_tags(client: StashClient, names: list[str]) -> list[dict[str, Any]]:
-    data = client.request(
-        f"""
-        query FindRootTags($tagFilter: TagFilterType, $filter: FindFilterType) {{
-          findTags(tag_filter: $tagFilter, filter: $filter) {{
-            tags {{
-              {_tag_tree_fields(TAG_TREE_DEPTH)}
-            }}
-          }}
-        }}
-        """,
+FIND_ROOT_TAGS = Operation[_FindTags](f"""
+    query FindRootTags($tagFilter: TagFilterType, $filter: FindFilterType) {{
+      findTags(tag_filter: $tagFilter, filter: $filter) {{
+        tags {{ {_tag_tree_fields(TAG_TREE_DEPTH)} }}
+      }}
+    }}
+""")
+
+
+def find_root_tags(client: StashClient, names: list[str]) -> list[TagTree]:
+    data = client.execute(
+        FIND_ROOT_TAGS,
         {
             "tagFilter": {
                 "name": {
@@ -90,280 +123,22 @@ def find_root_tags(client: StashClient, names: list[str]) -> list[dict[str, Any]
     return data["findTags"]["tags"]
 
 
-def find_galleries(client: StashClient, ids: list[str] | None = None) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindGalleries($filter: FindFilterType, $ids: [ID!]) {
-          findGalleries(filter: $filter, ids: $ids) {
-            galleries {
-              id
-              title
-              folder {
-                path
-              }
-              files {
-                path
-              }
-              tags {
-                id
-                name
-              }
-            }
-          }
-        }
-        """,
-        {"filter": {"per_page": -1}, "ids": ids},
-    )
+def _item_paths(item: _RawItem) -> list[str]:
+    files = [item.get("folder"), *item.get("files", []), *item.get("visual_files", [])]
+    return [path for file in files if file and (path := file.get("path"))]
+
+
+def find_items(client: StashClient, entity_type: EntityType, ids: list[str] | None) -> list[Item]:
+    entity = ENTITIES[entity_type]
+    data = client.execute(entity.find, {"filter": {"per_page": -1}, "ids": ids})
     return [
-        _normalize_item(
-            item,
-            [
-                (item.get("folder") or {}).get("path"),
-                *(file.get("path") for file in item.get("files") or []),
-            ],
-        )
-        for item in data["findGalleries"]["galleries"]
+        Item(id=item["id"], tag_ids=[tag["id"] for tag in item["tags"]], paths=_item_paths(item))
+        for item in data[entity.find_field][entity.results_field]
     ]
 
 
-def find_groups(client: StashClient, ids: list[str] | None = None) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindGroups($filter: FindFilterType, $ids: [ID!]) {
-          findGroups(filter: $filter, ids: $ids) {
-            groups {
-              id
-              name
-              tags {
-                id
-                name
-              }
-            }
-          }
-        }
-        """,
-        {"filter": {"per_page": -1}, "ids": ids},
-    )
-    return [_normalize_item(item) for item in data["findGroups"]["groups"]]
-
-
-def find_images(client: StashClient, ids: list[str] | None = None) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindImages($filter: FindFilterType, $ids: [ID!]) {
-          findImages(filter: $filter, ids: $ids) {
-            images {
-              id
-              title
-              visual_files {
-                ... on ImageFile {
-                  path
-                }
-              }
-              tags {
-                id
-                name
-              }
-            }
-          }
-        }
-        """,
-        {"filter": {"per_page": -1}, "ids": ids},
-    )
-    return [
-        _normalize_item(
-            item,
-            [file.get("path") for file in item.get("visual_files") or []],
-        )
-        for item in data["findImages"]["images"]
-    ]
-
-
-def find_scenes(client: StashClient, ids: list[str] | None = None) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindScenes($filter: FindFilterType, $ids: [ID!]) {
-          findScenes(filter: $filter, ids: $ids) {
-            scenes {
-              id
-              title
-              files {
-                path
-              }
-              tags {
-                id
-                name
-              }
-            }
-          }
-        }
-        """,
-        {"filter": {"per_page": -1}, "ids": ids},
-    )
-    return [
-        _normalize_item(item, [file.get("path") for file in item.get("files") or []])
-        for item in data["findScenes"]["scenes"]
-    ]
-
-
-def find_performers(client: StashClient, ids: list[str] | None = None) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindPerformers($filter: FindFilterType, $ids: [ID!]) {
-          findPerformers(filter: $filter, ids: $ids) {
-            performers {
-              id
-              name
-              rating100
-              tags {
-                id
-                name
-              }
-            }
-          }
-        }
-        """,
-        {"filter": {"per_page": -1}, "ids": ids},
-    )
-    return [_normalize_item(item) for item in data["findPerformers"]["performers"]]
-
-
-def update_gallery_tags(client: StashClient, gallery_id: str, tag_ids: list[str]) -> dict[str, Any]:
-    data = client.request(
-        """
-        mutation GalleryUpdate($input: GalleryUpdateInput!) {
-          galleryUpdate(input: $input) {
-            id
-            title
-          }
-        }
-        """,
-        {"input": {"id": gallery_id, "tag_ids": tag_ids}},
-    )
-    updated = data.get("galleryUpdate")
-    if not updated:
-        raise RuntimeError(f"Failed to update gallery: {gallery_id}")
-    return updated
-
-
-def bulk_update_gallery_tags(
-    client: StashClient, gallery_ids: list[str], tag_ids: list[str]
-) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        mutation BulkGalleryUpdate($input: BulkGalleryUpdateInput!) {
-          bulkGalleryUpdate(input: $input) {
-            id
-            title
-          }
-        }
-        """,
-        {"input": {"ids": gallery_ids, "tag_ids": {"ids": tag_ids, "mode": "SET"}}},
-    )
-    return data.get("bulkGalleryUpdate") or []
-
-
-def bulk_update_group_tags(
-    client: StashClient, group_ids: list[str], tag_ids: list[str]
-) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        mutation BulkGroupUpdate($input: BulkGroupUpdateInput!) {
-          bulkGroupUpdate(input: $input) {
-            id
-            name
-          }
-        }
-        """,
-        {"input": {"ids": group_ids, "tag_ids": {"ids": tag_ids, "mode": "SET"}}},
-    )
-    return data.get("bulkGroupUpdate") or []
-
-
-def bulk_update_image_tags(
-    client: StashClient, image_ids: list[str], tag_ids: list[str]
-) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        mutation BulkImageUpdate($input: BulkImageUpdateInput!) {
-          bulkImageUpdate(input: $input) {
-            id
-            title
-          }
-        }
-        """,
-        {"input": {"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "SET"}}},
-    )
-    return data.get("bulkImageUpdate") or []
-
-
-def update_scene_tags(client: StashClient, scene_id: str, tag_ids: list[str]) -> dict[str, Any]:
-    data = client.request(
-        """
-        mutation SceneUpdate($input: SceneUpdateInput!) {
-          sceneUpdate(input: $input) {
-            id
-            title
-          }
-        }
-        """,
-        {"input": {"id": scene_id, "tag_ids": tag_ids}},
-    )
-    updated = data.get("sceneUpdate")
-    if not updated:
-        raise RuntimeError(f"Failed to update scene: {scene_id}")
-    return updated
-
-
-def bulk_update_scene_tags(
-    client: StashClient, scene_ids: list[str], tag_ids: list[str]
-) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        mutation BulkSceneUpdate($input: BulkSceneUpdateInput!) {
-          bulkSceneUpdate(input: $input) {
-            id
-            title
-          }
-        }
-        """,
-        {"input": {"ids": scene_ids, "tag_ids": {"ids": tag_ids, "mode": "SET"}}},
-    )
-    return data.get("bulkSceneUpdate") or []
-
-
-def update_performer_tags(
-    client: StashClient, performer_id: str, tag_ids: list[str]
-) -> dict[str, Any]:
-    data = client.request(
-        """
-        mutation PerformerUpdate($input: PerformerUpdateInput!) {
-          performerUpdate(input: $input) {
-            id
-            name
-          }
-        }
-        """,
-        {"input": {"id": performer_id, "tag_ids": tag_ids}},
-    )
-    updated = data.get("performerUpdate")
-    if not updated:
-        raise RuntimeError(f"Failed to update performer: {performer_id}")
-    return updated
-
-
-def bulk_update_performer_tags(
-    client: StashClient, performer_ids: list[str], tag_ids: list[str]
-) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        mutation BulkPerformerUpdate($input: BulkPerformerUpdateInput!) {
-          bulkPerformerUpdate(input: $input) {
-            id
-            name
-          }
-        }
-        """,
-        {"input": {"ids": performer_ids, "tag_ids": {"ids": tag_ids, "mode": "SET"}}},
-    )
-    return data.get("bulkPerformerUpdate") or []
+def bulk_update_tags(
+    client: StashClient, entity_type: EntityType, ids: list[str], tag_ids: list[str]
+) -> None:
+    variables = {"input": {"ids": ids, "tag_ids": {"ids": tag_ids, "mode": "SET"}}}
+    _ = client.execute(ENTITIES[entity_type].bulk_update, variables)

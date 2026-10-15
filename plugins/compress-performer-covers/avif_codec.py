@@ -1,10 +1,10 @@
-import json
-import math
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from stash_plugin import as_list, as_object, parse_json
 
 MAX_QUALITY = 95
 PREFERRED_MIN_QUALITY = 75
@@ -41,12 +41,7 @@ def resolve_executable(configured_path: str | None, name: str) -> str:
 
 def _run(command: list[str], timeout: int = 120) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
+        return subprocess.run(command, capture_output=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Command timed out: {command[0]}") from exc
     except OSError as exc:
@@ -84,14 +79,14 @@ def probe_image(ffprobe_path: str, input_path: Path) -> ImageInfo:
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"FFprobe could not read the cover: {message or 'unknown error'}")
 
-    payload = json.loads(result.stdout)
-    streams = payload.get("streams") or []
+    payload = as_object(parse_json(result.stdout)) or {}
+    streams = as_list(payload.get("streams"))
     if not streams:
         raise RuntimeError("The cover does not contain a readable image stream")
 
-    width = int(streams[0].get("width") or 0)
-    height = int(streams[0].get("height") or 0)
-    if width <= 0 or height <= 0:
+    stream = as_object(streams[0]) or {}
+    width, height = stream.get("width"), stream.get("height")
+    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
         raise RuntimeError("Could not determine the cover dimensions")
     return ImageInfo(width=width, height=height)
 
@@ -169,7 +164,7 @@ def compress_cover(
     with tempfile.TemporaryDirectory(prefix="stash-cover-") as temp_dir:
         input_path = Path(temp_dir) / "source-image"
         output_path = Path(temp_dir) / "cover.avif"
-        input_path.write_bytes(source)
+        _ = input_path.write_bytes(source)
         source_info = probe_image(ffprobe_path, input_path)
 
         fallback: CompressedCover | None = None
@@ -188,7 +183,7 @@ def compress_cover(
             high = MAX_QUALITY
             best: tuple[bytes, int] | None = None
             while low <= high:
-                quality = math.floor((low + high) / 2)
+                quality = (low + high) // 2
                 encoded = encode_avif(
                     ffmpeg_path,
                     input_path,

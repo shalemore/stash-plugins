@@ -20,7 +20,7 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-pythonpath = ["scripts"]
+pythonpath = ["scripts", "shared"]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -29,28 +29,14 @@ target-version = "py311"
 src = ["scripts"]
 
 [tool.ruff.lint]
-select = [
-    "E",
-    "F",
-    "I",
-    "UP",
-]
-
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "PIE", "PERF", "FURB", "RUF"]
 
 [tool.basedpyright]
 pythonVersion = "3.11"
-typeCheckingMode = "standard"
-include = [
-    "plugins",
-    "scripts",
-    "tests",
-]
-extraPaths = ["scripts"]
-exclude = [
-    "**/__pycache__",
-    ".venv",
-]
-reportMissingTypeStubs = false
+typeCheckingMode = "recommended"
+include = ["plugins", "scripts", "shared", "tests"]
+extraPaths = ["scripts", "shared"]
+# Stash runs each plugin's main.py as a script, so plugins import their sibling modules directly.
+reportImplicitRelativeImport = false
+# The formatter wraps long strings into implicitly concatenated parts.
+reportImplicitStringConcatenation = false

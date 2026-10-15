@@ -1,201 +1,139 @@
-import json
-from dataclasses import dataclass
-from typing import Any
-from urllib.request import Request, urlopen
+from typing import NotRequired, TypedDict
 
-from plugin_runtime import build_cookie_header
+from stash_plugin import Operation, StashClient
 
 
-@dataclass
-class StashClient:
-    graphql_url: str
-    api_key: str | None
-    session_cookie: dict[str, Any] | None
-
-    def request(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["ApiKey"] = self.api_key
-
-        cookie_header = build_cookie_header(self.session_cookie)
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-
-        req = Request(self.graphql_url, data=payload, headers=headers, method="POST")
-        with urlopen(req, timeout=30) as response:
-            data = json.load(response)
-
-        if data.get("errors"):
-            raise RuntimeError(json.dumps(data["errors"], ensure_ascii=False))
-
-        return data["data"]
+class TagTree(TypedDict):
+    id: str
+    name: str
+    aliases: list[str]
+    # Absent on the deepest level of the queried tree.
+    children: NotRequired[list["TagTree"]]
 
 
-def find_tag(client: StashClient, tag_id: str) -> dict[str, Any]:
-    data = client.request(
-        """
-        query FindTag($id: ID!) {
-          findTag(id: $id) {
-            id
-            name
-            aliases
-            children {
-              id
-              name
-              aliases
-              children {
-                id
-                name
-                aliases
-              }
-            }
-          }
-        }
-        """,
-        {"id": tag_id},
-    )
-    tag = data.get("findTag")
-    if not tag:
-        raise RuntimeError(f"Tag not found: {tag_id}")
-    return tag
+class _Tags(TypedDict):
+    tags: list[TagTree]
 
 
-def search_tags(client: StashClient, query: str) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindTags($filter: FindFilterType) {
-          findTags(filter: $filter) {
-            tags {
-              id
-              name
-              aliases
-              children {
-                id
-                name
-                aliases
-                children {
-                  id
-                  name
-                  aliases
-                }
-              }
-            }
-          }
-        }
-        """,
-        {"filter": {"q": query, "per_page": -1}},
-    )
+class _FindTags(TypedDict):
+    findTags: _Tags
+
+
+class _TagCreate(TypedDict):
+    tagCreate: TagTree | None
+
+
+class _Folder(TypedDict):
+    path: str
+
+
+class _TagRef(TypedDict):
+    id: str
+
+
+class Gallery(TypedDict):
+    id: str
+    organized: bool
+    folder: _Folder | None
+    tags: list[_TagRef]
+
+
+class _Galleries(TypedDict):
+    galleries: list[Gallery]
+
+
+class _FindGalleries(TypedDict):
+    findGalleries: _Galleries
+
+
+class _FindGallery(TypedDict):
+    findGallery: Gallery | None
+
+
+class UpdatedGallery(TypedDict):
+    id: str
+    title: str | None
+    organized: bool
+
+
+class _GalleryUpdate(TypedDict):
+    galleryUpdate: UpdatedGallery | None
+
+
+GALLERY_FIELDS = "id organized folder { path } tags { id }"
+
+SEARCH_TAGS = Operation[_FindTags]("""
+    query FindTags($filter: FindFilterType) {
+      findTags(filter: $filter) {
+        tags { id name aliases children { id name aliases children { id name aliases } } }
+      }
+    }
+""")
+
+TAG_CREATE = Operation[_TagCreate]("""
+    mutation TagCreate($input: TagCreateInput!) {
+      tagCreate(input: $input) { id name aliases }
+    }
+""")
+
+GALLERY_UPDATE = Operation[_GalleryUpdate]("""
+    mutation GalleryUpdate($input: GalleryUpdateInput!) {
+      galleryUpdate(input: $input) { id title organized }
+    }
+""")
+
+FIND_GALLERIES = Operation[_FindGalleries](f"""
+    query FindGalleries($galleryFilter: GalleryFilterType, $filter: FindFilterType) {{
+      findGalleries(gallery_filter: $galleryFilter, filter: $filter) {{
+        galleries {{ {GALLERY_FIELDS} }}
+      }}
+    }}
+""")
+
+FIND_GALLERY = Operation[_FindGallery](f"""
+    query FindGallery($id: ID!) {{
+      findGallery(id: $id) {{ {GALLERY_FIELDS} }}
+    }}
+""")
+
+
+def search_tags(client: StashClient, query: str) -> list[TagTree]:
+    data = client.execute(SEARCH_TAGS, {"filter": {"q": query, "per_page": -1}})
     return data["findTags"]["tags"]
 
 
-def create_tag(
-    client: StashClient,
-    name: str,
-    parent_ids: list[str],
-    dry_run: bool,
-) -> dict[str, Any] | None:
-    if dry_run:
-        return None
-
-    data = client.request(
-        """
-        mutation TagCreate($input: TagCreateInput!) {
-          tagCreate(input: $input) {
-            id
-            name
-            aliases
-          }
-        }
-        """,
-        {"input": {"name": name, "aliases": [name], "parent_ids": parent_ids}},
+def create_tag(client: StashClient, name: str, parent_ids: list[str]) -> TagTree:
+    data = client.execute(
+        TAG_CREATE, {"input": {"name": name, "aliases": [name], "parent_ids": parent_ids}}
     )
-    created = data.get("tagCreate")
-    if not created:
+    if not (created := data["tagCreate"]):
         raise RuntimeError(f"Failed to create tag: {name}")
     return created
 
 
 def update_gallery(
-    client: StashClient,
-    gallery_id: str,
-    payload: dict[str, Any],
-    dry_run: bool,
-) -> dict[str, Any] | None:
-    if dry_run:
-        return None
-
-    data = client.request(
-        """
-        mutation GalleryUpdate($input: GalleryUpdateInput!) {
-          galleryUpdate(input: $input) {
-            id
-            title
-            organized
-          }
-        }
-        """,
-        {"input": {"id": gallery_id, **payload}},
-    )
-    updated = data.get("galleryUpdate")
-    if not updated:
+    client: StashClient, gallery_id: str, payload: dict[str, object]
+) -> UpdatedGallery:
+    data = client.execute(GALLERY_UPDATE, {"input": {"id": gallery_id, **payload}})
+    if not (updated := data["galleryUpdate"]):
         raise RuntimeError(f"Failed to update gallery: {gallery_id}")
     return updated
 
 
 def find_galleries(
-    client: StashClient,
-    path_contains: str | None,
-    skip_organized: bool,
-) -> list[dict[str, Any]]:
-    gallery_filter: dict[str, Any] = {}
+    client: StashClient, path_contains: str | None, skip_organized: bool
+) -> list[Gallery]:
+    gallery_filter: dict[str, object] = {}
     if path_contains:
         gallery_filter["path"] = {"value": path_contains, "modifier": "INCLUDES"}
     if skip_organized:
         gallery_filter["organized"] = False
 
-    data = client.request(
-        """
-        query FindGalleries($galleryFilter: GalleryFilterType, $filter: FindFilterType) {
-          findGalleries(gallery_filter: $galleryFilter, filter: $filter) {
-            galleries {
-              id
-              title
-              organized
-              folder {
-                path
-              }
-              tags {
-                id
-                name
-              }
-            }
-          }
-        }
-        """,
-        {"galleryFilter": gallery_filter or None, "filter": {"per_page": -1}},
+    data = client.execute(
+        FIND_GALLERIES, {"galleryFilter": gallery_filter or None, "filter": {"per_page": -1}}
     )
     return data["findGalleries"]["galleries"]
 
 
-def find_gallery_by_id(client: StashClient, gallery_id: str) -> dict[str, Any] | None:
-    data = client.request(
-        """
-        query FindGallery($id: ID!) {
-          findGallery(id: $id) {
-            id
-            title
-            organized
-            folder {
-              path
-            }
-            tags {
-              id
-              name
-            }
-          }
-        }
-        """,
-        {"id": gallery_id},
-    )
-    return data.get("findGallery")
+def find_gallery(client: StashClient, gallery_id: str) -> Gallery | None:
+    return client.execute(FIND_GALLERY, {"id": gallery_id})["findGallery"]

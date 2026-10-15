@@ -1,7 +1,8 @@
 """Builds the plugin source index that Stash reads.
 
 Usage: `python scripts/build_site.py [output]` writes `index.yml` and one `<id>.zip` per plugin
-to the output directory, `_site` by default. Each zip holds the plugin's directory.
+to the output directory, `_site` by default. Each zip holds the plugin's directory plus the
+modules in shared/.
 
 Stash offers an update whenever a plugin's date in the index moves forward, whatever its version.
 So a plugin whose version is already released is built from the commit that its tag points to,

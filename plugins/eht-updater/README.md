@@ -56,4 +56,4 @@ flowchart TD
 
 - The plugin no longer hardcodes your library path.
 - The plugin no longer depends on fixed tag IDs from one specific Stash database.
-- If your tag tree uses different names than `Audience`, `Gay`, `Straight`, or `Language`, adjust `constants.py`.
+- If your tag tree uses different names than `Audience`, `Gay`, `Straight`, or `Language`, adjust the constants at the top of `sync_logic.py`.

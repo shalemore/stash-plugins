@@ -13,10 +13,12 @@ from release_plan import unreleased
 def write_plugin(root: Path, version: str = "1.0.0", code: str = "print('hi')\n") -> Path:
     directory = root / "plugins" / "demo"
     (directory / "__pycache__").mkdir(parents=True, exist_ok=True)
+    (root / "shared").mkdir(exist_ok=True)
     manifest = f"name: Demo\ndescription: A demo\nversion: {version}\n"
     _ = (directory / "demo.yml").write_text(manifest, encoding="utf-8")
     _ = (directory / "main.py").write_bytes(code.encode())
     _ = (directory / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"\x00")
+    _ = (root / "shared" / "stash_plugin.py").write_text("SHARED = 1\n", encoding="utf-8")
     return directory
 
 
@@ -30,7 +32,7 @@ def commit(root: Path, timestamp: int, tag: str | None = None) -> None:
 
     if not (root / ".git").exists():
         git("init", "-q")
-    git("add", "plugins/demo/demo.yml", "plugins/demo/main.py")
+    git("add", "plugins/demo/demo.yml", "plugins/demo/main.py", "shared")
     git("commit", "-q", "-m", "change")
     if tag:
         git("tag", tag)
@@ -43,7 +45,7 @@ def build_site(root: Path, output: Path) -> tuple[str, bytes]:
         return (output / "index.yml").read_text(encoding="utf-8"), archive.read("main.py")
 
 
-def test_zip_is_reproducible_and_skips_bytecode(tmp_path: Path):
+def test_zip_is_reproducible_bundles_shared_modules_and_skips_bytecode(tmp_path: Path):
     files = working_files(load_plugin(write_plugin(tmp_path)))
     first, second = tmp_path / "first.zip", tmp_path / "second.zip"
     zip_files(files, first)
@@ -51,7 +53,7 @@ def test_zip_is_reproducible_and_skips_bytecode(tmp_path: Path):
 
     assert first.read_bytes() == second.read_bytes()
     with zipfile.ZipFile(first) as archive:
-        assert archive.namelist() == ["demo.yml", "main.py"]
+        assert archive.namelist() == ["demo.yml", "main.py", "stash_plugin.py"]
 
 
 def test_a_released_version_is_built_as_tagged(tmp_path: Path):

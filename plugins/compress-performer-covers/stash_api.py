@@ -1,137 +1,116 @@
-import json
-from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
+from typing import TypedDict
+from urllib.request import Request
 
-from plugin_runtime import build_cookie_header
+from stash_plugin import Operation, StashClient, as_object, open_url
 
 PLUGIN_ID = "compress-performer-covers"
+IMAGE_TIMEOUT = 30
 
 
-@dataclass
-class StashClient:
-    graphql_url: str
-    api_key: str | None
-    session_cookie: dict[str, Any] | None
-
-    def _headers(self) -> dict[str, str]:
-        headers = {"User-Agent": "stash-compress-performer-covers/0.1"}
-        if self.api_key:
-            headers["ApiKey"] = self.api_key
-
-        cookie_header = build_cookie_header(self.session_cookie)
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-        return headers
-
-    def request(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
-        headers = {"Content-Type": "application/json", **self._headers()}
-        request = Request(self.graphql_url, data=payload, headers=headers, method="POST")
-        with urlopen(request, timeout=60) as response:
-            data = json.load(response)
-
-        if data.get("errors"):
-            raise RuntimeError(json.dumps(data["errors"], ensure_ascii=False))
-        return data["data"]
-
-    def image_url(self, image_path: str) -> str:
-        if image_path.lower().startswith(("http://", "https://")):
-            return image_path
-
-        parsed = urlsplit(self.graphql_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}/"
-        return urljoin(origin, image_path)
-
-    def image_size(self, image_path: str) -> int | None:
-        request = Request(self.image_url(image_path), headers=self._headers(), method="HEAD")
-        try:
-            with urlopen(request, timeout=30) as response:
-                value = response.headers.get("Content-Length")
-        except OSError:
-            return None
-
-        if not value:
-            return None
-        try:
-            return int(value)
-        except ValueError:
-            return None
-
-    def download_image(self, image_path: str) -> bytes:
-        request = Request(self.image_url(image_path), headers=self._headers())
-        with urlopen(request, timeout=30) as response:
-            return response.read()
+class Performer(TypedDict):
+    id: str
+    name: str
+    image_path: str | None
 
 
-def find_performers(client: StashClient) -> list[dict[str, Any]]:
-    data = client.request(
-        """
-        query FindPerformers($filter: FindFilterType) {
-          findPerformers(filter: $filter) {
-            performers {
-              id
-              name
-              image_path
-            }
-          }
-        }
-        """,
-        {"filter": {"per_page": -1, "sort": "name", "direction": "ASC"}},
+class _Performers(TypedDict):
+    performers: list[Performer]
+
+
+class _FindPerformers(TypedDict):
+    findPerformers: _Performers
+
+
+class _FindPerformer(TypedDict):
+    findPerformer: Performer | None
+
+
+class SystemStatus(TypedDict):
+    ffmpegPath: str | None
+    ffprobePath: str | None
+
+
+class _Configuration(TypedDict):
+    plugins: object
+
+
+class _RuntimeConfig(TypedDict):
+    systemStatus: SystemStatus
+    configuration: _Configuration
+
+
+class _Updated(TypedDict):
+    id: str
+
+
+class _PerformerUpdate(TypedDict):
+    performerUpdate: _Updated | None
+
+
+FIND_PERFORMERS = Operation[_FindPerformers]("""
+    query FindPerformers($filter: FindFilterType) {
+      findPerformers(filter: $filter) {
+        performers { id name image_path }
+      }
+    }
+""")
+
+FIND_PERFORMER = Operation[_FindPerformer]("""
+    query FindPerformer($id: ID!) {
+      findPerformer(id: $id) { id name image_path }
+    }
+""")
+
+RUNTIME_CONFIG = Operation[_RuntimeConfig]("""
+    query RuntimeConfig($pluginIds: [ID!]) {
+      systemStatus { ffmpegPath ffprobePath }
+      configuration { plugins(include: $pluginIds) }
+    }
+""")
+
+PERFORMER_UPDATE = Operation[_PerformerUpdate]("""
+    mutation PerformerUpdate($input: PerformerUpdateInput!) {
+      performerUpdate(input: $input) { id }
+    }
+""")
+
+
+def find_performers(client: StashClient) -> list[Performer]:
+    data = client.execute(
+        FIND_PERFORMERS, {"filter": {"per_page": -1, "sort": "name", "direction": "ASC"}}
     )
     return data["findPerformers"]["performers"]
 
 
-def find_performer(client: StashClient, performer_id: str) -> dict[str, Any] | None:
-    data = client.request(
-        """
-        query FindPerformer($id: ID!) {
-          findPerformer(id: $id) {
-            id
-            name
-            image_path
-          }
-        }
-        """,
-        {"id": performer_id},
-    )
-    return data.get("findPerformer")
+def find_performer(client: StashClient, performer_id: str) -> Performer | None:
+    return client.execute(FIND_PERFORMER, {"id": performer_id})["findPerformer"]
 
 
-def get_runtime_config(client: StashClient) -> dict[str, Any]:
-    data = client.request(
-        """
-        query RuntimeConfig($pluginIds: [ID!]) {
-          systemStatus {
-            ffmpegPath
-            ffprobePath
-            os
-          }
-          configuration {
-            plugins(include: $pluginIds)
-          }
-        }
-        """,
-        {"pluginIds": [PLUGIN_ID]},
-    )
-    plugin_configs = data["configuration"].get("plugins") or {}
-    return {
-        "system": data["systemStatus"],
-        "settings": plugin_configs.get(PLUGIN_ID) or {},
-    }
+def get_runtime_config(client: StashClient) -> tuple[SystemStatus, dict[str, object]]:
+    """Stash's FFmpeg paths and this plugin's settings."""
+    data = client.execute(RUNTIME_CONFIG, {"pluginIds": [PLUGIN_ID]})
+    plugins = as_object(data["configuration"]["plugins"]) or {}
+    return data["systemStatus"], as_object(plugins.get(PLUGIN_ID)) or {}
 
 
 def update_performer_image(client: StashClient, performer_id: str, data_url: str) -> None:
-    data = client.request(
-        """
-        mutation PerformerUpdate($input: PerformerUpdateInput!) {
-          performerUpdate(input: $input) {
-            id
-          }
-        }
-        """,
-        {"input": {"id": performer_id, "image": data_url}},
-    )
-    if not data.get("performerUpdate"):
+    data = client.execute(PERFORMER_UPDATE, {"input": {"id": performer_id, "image": data_url}})
+    if not data["performerUpdate"]:
         raise RuntimeError(f"Failed to update the cover for performer {performer_id}")
+
+
+def image_size(client: StashClient, image_path: str) -> int | None:
+    """The size the server reports for an image, or None when it does not say."""
+    request = Request(client.url(image_path), headers=client.headers(), method="HEAD")
+    try:
+        with open_url(request, IMAGE_TIMEOUT) as response:
+            value = response.headers.get("Content-Length")
+    except OSError:
+        return None
+    return int(value) if value and value.isdigit() else None
+
+
+def download_image(client: StashClient, image_path: str) -> bytes:
+    request = Request(client.url(image_path), headers=client.headers())
+    with open_url(request, IMAGE_TIMEOUT) as response:
+        return response.read()

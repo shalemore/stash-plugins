@@ -9,6 +9,8 @@ limits.
 import json
 import os
 import sys
+from http.client import HTTPResponse
+from typing import TypedDict, cast
 from urllib.request import Request, urlopen
 
 from graphql import build_schema, print_schema
@@ -19,25 +21,41 @@ API = "https://api.github.com/repos/stashapp/stash"
 OUTPUT = ROOT / "schema" / "stash.graphql"
 
 
+class Entry(TypedDict):
+    name: str
+    sha: str
+
+
+class Release(TypedDict):
+    tag_name: str
+
+
 def fetch(path: str, *, raw: bool = False) -> str:
     headers = {
         "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json"
     }
     if token := os.getenv("GITHUB_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
-    with urlopen(Request(f"{API}/{path}", headers=headers), timeout=60) as response:
+    # typeshed types urlopen() as Any; for https URLs it returns an HTTPResponse.
+    request = Request(f"{API}/{path}", headers=headers)
+    with cast(HTTPResponse, urlopen(request, timeout=60)) as response:
         return response.read().decode("utf-8")
 
 
-def list_directory(path: str, tag: str) -> list[dict[str, str]]:
-    entries = json.loads(fetch(f"contents/{path}?ref={tag}"))
+def fetch_json(path: str) -> object:
+    return cast(object, json.loads(fetch(path)))
+
+
+# The casts below rely on the documented shapes of GitHub's REST API.
+def list_directory(path: str, tag: str) -> list[Entry]:
+    entries = fetch_json(f"contents/{path}?ref={tag}")
     if not isinstance(entries, list):
         raise RuntimeError(f"{path} is not a directory in Stash {tag}")
-    return entries
+    return cast("list[Entry]", entries)
 
 
 def latest_release() -> str:
-    return json.loads(fetch("releases/latest"))["tag_name"]
+    return cast(Release, fetch_json("releases/latest"))["tag_name"]
 
 
 def schema_fingerprint(tag: str) -> str:
@@ -60,7 +78,8 @@ def main(tag: str | None) -> None:
     # Building the schema validates it; printing normalizes the order and formatting.
     schema = print_schema(build_schema("\n".join(schema_sources(tag))))
     OUTPUT.parent.mkdir(exist_ok=True)
-    OUTPUT.write_text(f"# Stash {tag} {fingerprint}\n\n{schema}\n", encoding="utf-8")
+    content = f"# Stash {tag} {fingerprint}\n\n{schema}\n"
+    _ = OUTPUT.write_text(content, encoding="utf-8", newline="\n")
     print(f"Downloaded the schema of Stash {tag} ({fingerprint[:10]})")
 
 
