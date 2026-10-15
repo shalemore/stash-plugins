@@ -132,14 +132,12 @@ SCRAPE_SCENE = Operation[_ScrapeScene]("""
 """)
 
 
-def find_scenes(
-    client: StashClient, ids: list[str] | None = None, imdb_ids: list[str] | None = None
-) -> list[Scene]:
-    path_regex = rf"\[imdbid=({'|'.join(imdb_ids)})\]" if imdb_ids else IMDB_PATH_REGEX
+def find_scenes(client: StashClient, ids: list[str] | None = None) -> list[Scene]:
+    """The scenes in IMDb folders, optionally only those with the given IDs."""
     data = client.execute(
         FIND_SCENES,
         {
-            "sceneFilter": {"path": {"value": path_regex, "modifier": "MATCHES_REGEX"}},
+            "sceneFilter": {"path": {"value": IMDB_PATH_REGEX, "modifier": "MATCHES_REGEX"}},
             "filter": {"per_page": -1},
             "ids": ids,
         },

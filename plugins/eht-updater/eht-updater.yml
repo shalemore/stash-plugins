@@ -1,6 +1,6 @@
 name: E-Hentai Gallery Updater
 description: Populate gallery metadata from E-Hentai folder names and auto-create required tags
-version: 0.2.1
+version: 0.3.0
 
 url: https://github.com/shalemore/stash-plugins
 
@@ -30,10 +30,7 @@ tasks:
 
 hooks:
   - name: Auto Update After Scan
-    description: Auto-populate E-Hentai metadata after gallery create and update scan events
+    description: Queue a background job that updates unorganized galleries after a scan creates or updates galleries
     triggeredBy:
       - Gallery.Create.Post
       - Gallery.Update.Post
-    defaultArgs:
-      dry_run: false
-      skip_organized: true

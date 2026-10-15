@@ -24,13 +24,15 @@ Stash external plugin for scenes inside `<title> [imdbid=ttXXXXXXX]/` folders, f
 
 - `Sync All`: process every scene under an `[imdbid=...]` folder.
 - `Dry Run`: show what would change without writing anything.
-- `Auto Sync After Scan`: runs on `Scene.Create.Post` and processes the whole IMDb entry of the new
-  scene, so `scene_index` stays consistent when a new season arrives.
+- `Auto Sync After Scan`: runs on `Scene.Create.Post`. When the new scene is in an `[imdbid=...]`
+  folder, it queues `Sync All` as a background job, so the scan does not wait for the scrapers or
+  the IMDb dataset. While that job waits to start, later scenes queue nothing more, so a scan ends
+  with a single job, which shows up under `Settings -> Tasks`. Processing every title also keeps
+  `scene_index` consistent when a new season arrives.
 
-A scan runs the hook for several files at once, so runs that have work to do are serialized with a
-lock file (`<stash config dir>/cache/imdb-updater.lock`). Without it, files of the same title could
-each find no group and each create their own. Scenes outside `[imdbid=...]` folders return before
-taking the lock.
+Runs are serialized with a lock file (`<stash config dir>/cache/imdb-updater.lock`), so a run
+started from the Tasks page and a queued job cannot each find no group for a title and each create
+their own.
 
 ## Episode IDs
 

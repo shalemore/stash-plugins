@@ -1,6 +1,6 @@
 name: IMDb Updater
 description: Link scenes in [imdbid=ttXXXX] folders to IMDb groups and fill TV episode metadata with Stash's IMDB scraper
-version: 0.2.0
+version: 0.3.0
 
 url: https://github.com/shalemore/stash-plugins
 
@@ -23,8 +23,6 @@ tasks:
 
 hooks:
   - name: Auto Sync After Scan
-    description: Link newly scanned scenes to their IMDb group and fill TV episode metadata
+    description: Queue a background job that syncs new scenes in IMDb folders after a scan
     triggeredBy:
       - Scene.Create.Post
-    defaultArgs:
-      dry_run: false

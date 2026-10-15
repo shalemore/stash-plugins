@@ -9,6 +9,16 @@ Stash external plugin for galleries whose folder name is `gid_token`.
 - Reuses existing `Audience` and `Language` tags when present.
 - Auto-creates missing `Audience`, `Gay`, `Straight`, language parent tags, and `<Language> Subtitle` tags when needed.
 
+## Tasks and hooks
+
+- `Update Unorganized Galleries`: update every gallery that is not organized yet.
+- `Force Update All`: overwrite the metadata of every matching gallery.
+- `Preview Update`: show the planned changes without writing them.
+- `Auto Update After Scan`: runs when a scan creates or updates a gallery, not when you edit one.
+  It queues `Update Unorganized Galleries` as a background job, so the scan does not wait for
+  E-Hentai. While that job waits to start, later galleries queue nothing more, so a scan ends with
+  a single job, which shows up under `Settings -> Tasks`.
+
 ## Expected Tag Structure
 
 ```mermaid

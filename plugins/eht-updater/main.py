@@ -1,13 +1,40 @@
-from stash_plugin import PluginInput, StashClient, as_bool, emit_info, emit_warn, run_plugin
+"""Fills gallery metadata from E-Hentai, using the gid_token folder names of galleries.
+
+A scan runs the hook for every gallery it creates or updates. The hook only queues the task that
+updates unorganized galleries as a Stash job, once, so the scan does not wait for E-Hentai and
+ends with a single job that handles every new gallery.
+"""
+
+from stash_plugin import (
+    PluginInput,
+    StashClient,
+    as_bool,
+    emit_info,
+    emit_warn,
+    queue_task,
+    run_plugin,
+)
+
+PLUGIN_ID = "eht-updater"
+# The task the hook queues, as named in the manifest.
+TASK_NAME = "Update Unorganized Galleries"
+# Fixed, so that a scan queues only one job while it waits to start.
+JOB_DESCRIPTION = "Update unorganized E-Hentai galleries after a scan"
+
+
+def queue_update(plugin_input: PluginInput) -> object:
+    client = StashClient.connect(plugin_input, timeout=30)
+    queued = queue_task(client, PLUGIN_ID, TASK_NAME, JOB_DESCRIPTION)
+    if queued:
+        emit_info(f"Queued: {JOB_DESCRIPTION}")
+    return {"queued": queued}
 
 
 def run(plugin_input: PluginInput) -> object:
-    hook = plugin_input.hook
-    # Only galleries that a scan creates or updates are synced. Edits in the UI carry an input.
-    if hook and hook.input is not None:
-        return None
+    if hook := plugin_input.hook:
+        # Only scans are synced. Edits in the UI carry an input.
+        return queue_update(plugin_input) if hook.input is None else None
 
-    # Imported only now, so that the hooks of edits in the UI exit fast.
     from sync_logic import Taxonomy, collect_targets, process_targets, select_target_galleries
 
     args = plugin_input.args

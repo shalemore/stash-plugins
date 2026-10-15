@@ -9,7 +9,6 @@ from stash_api import (
     UpdatedGallery,
     create_tag,
     find_galleries,
-    find_gallery,
     search_tags,
     update_gallery,
 )
@@ -251,30 +250,9 @@ def sync_gallery_metadata(taxonomy: Taxonomy, target: Target) -> dict[str, objec
 
 
 def select_target_galleries(client: StashClient, plugin_input: PluginInput) -> list[Gallery]:
-    args, hook = plugin_input.args, plugin_input.hook
+    args = plugin_input.args
     path_contains = as_str(args.get("path_contains")) or None
-    skip_organized = as_bool(args.get("skip_organized"), True)
-
-    if not hook:
-        return find_galleries(client, path_contains, skip_organized)
-    if hook.id is None:
-        raise RuntimeError("The hook did not provide a gallery ID")
-
-    gallery = find_gallery(client, hook.id)
-    if not gallery:
-        emit_warn(f"Hook target gallery was not found: id={hook.id}")
-        return []
-    if path_contains and path_contains not in (folder_path(gallery) or ""):
-        emit_info(
-            f"{gallery_log_prefix(gallery)} Hook target skipped because path filter did not match"
-        )
-        return []
-    if skip_organized and gallery["organized"]:
-        emit_info(
-            f"{gallery_log_prefix(gallery)} Hook target skipped because it is already organized"
-        )
-        return []
-    return [gallery]
+    return find_galleries(client, path_contains, as_bool(args.get("skip_organized"), True))
 
 
 def collect_targets(galleries: list[Gallery]) -> tuple[list[Target], list[dict[str, object]]]:

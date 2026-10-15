@@ -46,10 +46,6 @@ class _FindGalleries(TypedDict):
     findGalleries: _Galleries
 
 
-class _FindGallery(TypedDict):
-    findGallery: Gallery | None
-
-
 class UpdatedGallery(TypedDict):
     id: str
     title: str | None
@@ -90,12 +86,6 @@ FIND_GALLERIES = Operation[_FindGalleries](f"""
     }}
 """)
 
-FIND_GALLERY = Operation[_FindGallery](f"""
-    query FindGallery($id: ID!) {{
-      findGallery(id: $id) {{ {GALLERY_FIELDS} }}
-    }}
-""")
-
 
 def search_tags(client: StashClient, query: str) -> list[TagTree]:
     data = client.execute(SEARCH_TAGS, {"filter": {"q": query, "per_page": -1}})
@@ -133,7 +123,3 @@ def find_galleries(
         FIND_GALLERIES, {"galleryFilter": gallery_filter or None, "filter": {"per_page": -1}}
     )
     return data["findGalleries"]["galleries"]
-
-
-def find_gallery(client: StashClient, gallery_id: str) -> Gallery | None:
-    return client.execute(FIND_GALLERY, {"id": gallery_id})["findGallery"]
