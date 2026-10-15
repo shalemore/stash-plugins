@@ -257,9 +257,6 @@ def select_target_galleries(client: StashClient, plugin_input: PluginInput) -> l
 
     if not hook:
         return find_galleries(client, path_contains, skip_organized)
-    if hook.input is not None:
-        emit_info("Hook invocation ignored because hookContext.input was present")
-        return []
     if hook.id is None:
         raise RuntimeError("The hook did not provide a gallery ID")
 

@@ -2,25 +2,27 @@
 
 Plugins import this as a sibling module. It lives here once, and the build copies it into each
 plugin's zip.
+
+Stash runs a hook's plugin for every saved object and waits for it, so a hook with nothing to do
+must exit fast. Importing a module like urllib.request alone takes ~80ms, so this module imports
+only what reading the input needs, and plugins import their own modules after deciding to work.
 """
+
+from __future__ import annotations
 
 import json
 import os
-import re
 import sys
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
-from urllib.error import URLError
-from urllib.parse import urljoin, urlsplit
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypedDict, TypeVar, cast
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
     from http.client import HTTPResponse
     from urllib.request import Request
 
-# The errors a plugin reports to Stash as a failed run instead of a traceback.
-FAILURES = (URLError, TimeoutError, RuntimeError, ValueError, KeyError)
+# The errors a plugin reports to Stash as a failed run instead of a traceback. OSError covers
+# network errors and timeouts.
+FAILURES = (OSError, RuntimeError, ValueError, KeyError)
 
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -35,6 +37,10 @@ def _log(level: str, message: str) -> None:
     print("\n".join(f"\x01{level}\x02{line}" for line in lines), file=sys.stderr, flush=True)
 
 
+def emit_debug(message: str) -> None:
+    _log("d", message)
+
+
 def emit_info(message: str) -> None:
     _log("i", message)
 
@@ -47,12 +53,12 @@ def emit_progress(progress: float) -> None:
     _log("p", f"{max(0.0, min(1.0, progress)):.4f}")
 
 
-@dataclass
 class Progress:
     """Reports to Stash how many of the total steps are done."""
 
-    total: int
-    done: int = 0
+    def __init__(self, total: int) -> None:
+        self.total: int = total
+        self.done: int = 0
 
     def step(self) -> None:
         self.done += 1
@@ -85,24 +91,20 @@ def as_bool(value: object, default: bool) -> bool:
     return str(value).strip().lower() == "true"
 
 
-def open_url(request: "Request", timeout: float) -> "HTTPResponse":
-    # Imported here because urllib.request costs ~100ms at startup, and hooks with nothing to do
-    # never need it.
+def open_url(request: Request, timeout: float) -> HTTPResponse:
     from urllib.request import urlopen
 
     # typeshed types urlopen() as Any; for http(s) URLs it returns an HTTPResponse.
     return cast("HTTPResponse", urlopen(request, timeout=timeout))
 
 
-@dataclass(frozen=True)
-class HookContext:
+class HookContext(NamedTuple):
     id: str | None
     input: dict[str, object] | None
     input_fields: list[str]
 
 
-@dataclass(frozen=True)
-class PluginInput:
+class PluginInput(NamedTuple):
     graphql_url: str
     config_dir: str | None
     cookie: str | None
@@ -142,8 +144,7 @@ def session_cookie(cookie: object) -> str | None:
 
 def read_plugin_input() -> PluginInput:
     raw = sys.stdin.read().strip()
-    data = as_object(parse_json(raw)) if raw else None
-    data = data or {}
+    data = (as_object(parse_json(raw)) if raw else None) or {}
     connection = as_object(data.get("server_connection")) or {}
     return PluginInput(
         graphql_url=graphql_url(connection),
@@ -154,22 +155,23 @@ def read_plugin_input() -> PluginInput:
 
 
 def read_api_key(config_dir: str | None) -> str | None:
+    import re
+
     if environment_key := os.getenv("STASH_KEY"):
         return environment_key
     if not config_dir:
         return None
-
-    config_path = Path(config_dir) / "config.yml"
-    if not config_path.exists():
+    try:
+        with open(os.path.join(config_dir, "config.yml"), encoding="utf-8") as config:
+            match = re.search(r"^api_key:\s*(\S+)", config.read(), re.MULTILINE)
+    except FileNotFoundError:
         return None
-    match = re.search(r"^api_key:\s*(\S+)", config_path.read_text(encoding="utf-8"), re.MULTILINE)
     return match[1] if match else None
 
 
 Data = TypeVar("Data")
 
 
-@dataclass(frozen=True)
 class Operation(Generic[Data]):
     """A GraphQL document together with the shape of the data it returns.
 
@@ -177,18 +179,18 @@ class Operation(Generic[Data]):
     the schema only by reading it.
     """
 
-    document: str
+    def __init__(self, document: str) -> None:
+        self.document: str = document
 
 
-@dataclass(frozen=True)
-class StashClient:
+class StashClient(NamedTuple):
     graphql_url: str
     api_key: str | None
     cookie: str | None
     timeout: float = 60
 
     @classmethod
-    def connect(cls, plugin_input: PluginInput, timeout: float = 60) -> "StashClient":
+    def connect(cls, plugin_input: PluginInput, timeout: float = 60) -> StashClient:
         return cls(
             graphql_url=plugin_input.graphql_url,
             api_key=read_api_key(plugin_input.config_dir),
@@ -208,6 +210,8 @@ class StashClient:
 
     def url(self, path: str) -> str:
         """Resolves a path that Stash returned, such as an image path, against its address."""
+        from urllib.parse import urljoin, urlsplit
+
         if path.lower().startswith(("http://", "https://")):
             return path
         parsed = urlsplit(self.graphql_url)
@@ -232,6 +236,53 @@ class StashClient:
             raise RuntimeError("Stash returned no data")
         # The schema guarantees that the data has the shape of the document's selection set.
         return cast(Data, body["data"])
+
+
+class _Job(TypedDict):
+    status: str
+    description: str
+
+
+class _JobQueue(TypedDict):
+    jobQueue: list[_Job] | None
+
+
+class _RunPluginTask(TypedDict):
+    runPluginTask: str
+
+
+JOB_QUEUE = Operation[_JobQueue]("query JobQueue { jobQueue { status description } }")
+
+RUN_PLUGIN_TASK = Operation[_RunPluginTask]("""
+    mutation RunPluginTask($pluginId: ID!, $taskName: String!, $description: String, $args: Map) {
+      runPluginTask(
+        plugin_id: $pluginId, task_name: $taskName, description: $description, args_map: $args
+      )
+    }
+""")
+
+
+def queue_task(
+    client: StashClient,
+    plugin_id: str,
+    task_name: str,
+    description: str,
+    args: Mapping[str, object] | None = None,
+) -> bool:
+    """Queues a task of the plugin as a background job in Stash, unless the same job is already
+    waiting to start. Returns whether it queued one.
+
+    Hooks use this to hand slow work to Stash's job queue, so that saving does not wait for it.
+    """
+    jobs = client.execute(JOB_QUEUE, {})["jobQueue"] or []
+    # Stash prefixes the description, so the job's description ends with ours.
+    if any(job["status"] == "READY" and job["description"].endswith(description) for job in jobs):
+        return False
+    _ = client.execute(
+        RUN_PLUGIN_TASK,
+        {"pluginId": plugin_id, "taskName": task_name, "description": description, "args": args},
+    )
+    return True
 
 
 def run_plugin(run: Callable[[PluginInput], object]) -> None:

@@ -1,227 +1,169 @@
+"""Encodes a cover to the best-looking AVIF that fits a size limit, with FFmpeg's libaom.
+
+The settings come from a benchmark on real covers scaled to 720px and scored with SSIMULACRA2 at
+~95 KiB. All-intra mode with libaom's image-quality tuning and full chroma looked better than the
+video mode used before and encoded 5 times faster. Lower cpu-used values took over 4 times as long
+for a barely visible gain.
+"""
+
+import math
+import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
-from stash_plugin import as_list, as_object, parse_json
-
-MAX_QUALITY = 95
-PREFERRED_MIN_QUALITY = 75
+MAX_WIDTH = 720
 MIN_DIMENSION = 160
+# CRF runs from 0 to 63, lower is better. A cover that only fits above MAX_CRF would look too
+# degraded, so a smaller one is encoded instead.
+MAX_CRF = 25
+# A typical cover fits at about this CRF, and its size shrinks by about this ratio per CRF step.
+FIRST_GUESS_CRF = 12
+SIZE_RATIO_PER_CRF = 0.94
 
-
-@dataclass(frozen=True)
-class ImageInfo:
-    width: int
-    height: int
+ENCODER = ["-c:v", "libaom-av1", "-usage", "allintra", "-cpu-used", "6", "-row-mt", "1"]
+# libaom 3.12 added this tuning for still images.
+IMAGE_TUNING = ["-aom-params", "tune=iq"]
 
 
 @dataclass(frozen=True)
 class CompressedCover:
     data: bytes
-    quality: int
+    crf: int
     width: int
     height: int
 
 
 def resolve_executable(configured_path: str | None, name: str) -> str:
-    if configured_path:
-        path = Path(configured_path)
-        if path.is_file():
-            return str(path)
-
-    discovered = shutil.which(name)
-    if discovered:
+    if configured_path and Path(configured_path).is_file():
+        return configured_path
+    if discovered := shutil.which(name):
         return discovered
-
     detail = f"; Stash returned path: {configured_path}" if configured_path else ""
     raise RuntimeError(f"Could not find {name}{detail}")
 
 
-def _run(command: list[str], timeout: int = 120) -> subprocess.CompletedProcess[bytes]:
+def run_ffmpeg(ffmpeg: str, *args: str) -> None:
+    command = [ffmpeg, "-v", "error", "-y", *args]
     try:
-        return subprocess.run(command, capture_output=True, check=False, timeout=timeout)
+        result = subprocess.run(command, capture_output=True, check=False, timeout=180)
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Command timed out: {command[0]}") from exc
+        raise RuntimeError("FFmpeg timed out") from exc
     except OSError as exc:
-        raise RuntimeError(f"Could not execute {command[0]}: {exc}") from exc
-
-
-def validate_ffmpeg(ffmpeg_path: str) -> None:
-    encoders = _run([ffmpeg_path, "-hide_banner", "-encoders"])
-    muxers = _run([ffmpeg_path, "-hide_banner", "-muxers"])
-    encoder_text = (encoders.stdout + encoders.stderr).decode("utf-8", errors="replace")
-    muxer_text = (muxers.stdout + muxers.stderr).decode("utf-8", errors="replace")
-
-    if encoders.returncode != 0 or "libaom-av1" not in encoder_text:
-        raise RuntimeError("FFmpeg does not include the libaom-av1 encoder required for AVIF")
-    if muxers.returncode != 0 or " avif " not in f" {muxer_text} ":
-        raise RuntimeError("FFmpeg does not include the AVIF muxer")
-
-
-def probe_image(ffprobe_path: str, input_path: Path) -> ImageInfo:
-    result = _run(
-        [
-            ffprobe_path,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "json",
-            str(input_path),
-        ]
-    )
+        raise RuntimeError(f"Could not execute {ffmpeg}: {exc}") from exc
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"FFprobe could not read the cover: {message or 'unknown error'}")
-
-    payload = as_object(parse_json(result.stdout)) or {}
-    streams = as_list(payload.get("streams"))
-    if not streams:
-        raise RuntimeError("The cover does not contain a readable image stream")
-
-    stream = as_object(streams[0]) or {}
-    width, height = stream.get("width"), stream.get("height")
-    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
-        raise RuntimeError("Could not determine the cover dimensions")
-    return ImageInfo(width=width, height=height)
+        raise RuntimeError(f"FFmpeg failed: {message or 'unknown error'}")
 
 
-def quality_to_crf(quality: int) -> int:
-    return max(0, min(63, round((100 - quality) * 63 / 100)))
+class Encoder:
+    def __init__(self, ffmpeg: str) -> None:
+        self.ffmpeg: str = ffmpeg
+        self.args: list[str] = self._supported_args()
 
-
-def scaled_dimensions(info: ImageInfo, max_width: int, scale: float) -> ImageInfo:
-    initial_scale = min(1.0, max_width / info.width)
-    width = max(2, round(info.width * initial_scale * scale))
-    height = max(2, round(info.height * initial_scale * scale))
-    width -= width % 2
-    height -= height % 2
-    return ImageInfo(width=width, height=height)
-
-
-def encode_avif(
-    ffmpeg_path: str,
-    input_path: Path,
-    output_path: Path,
-    dimensions: ImageInfo,
-    quality: int,
-) -> bytes:
-    output_path.unlink(missing_ok=True)
-    result = _run(
-        [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(input_path),
-            "-map_metadata",
-            "-1",
-            "-frames:v",
-            "1",
-            "-vf",
-            f"scale={dimensions.width}:{dimensions.height}:flags=lanczos",
-            "-c:v",
-            "libaom-av1",
-            "-still-picture",
-            "1",
-            "-crf",
-            str(quality_to_crf(quality)),
-            "-b:v",
-            "0",
-            "-cpu-used",
-            "4",
-            "-row-mt",
-            "1",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "avif",
-            str(output_path),
-        ],
-        timeout=180,
-    )
-    if result.returncode != 0 or not output_path.exists():
-        message = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"FFmpeg failed to encode AVIF: {message or 'unknown error'}")
-    return output_path.read_bytes()
-
-
-def compress_cover(
-    source: bytes,
-    ffmpeg_path: str,
-    ffprobe_path: str,
-    target_bytes: int,
-    min_quality: int,
-    max_width: int,
-) -> CompressedCover:
-    with tempfile.TemporaryDirectory(prefix="stash-cover-") as temp_dir:
-        input_path = Path(temp_dir) / "source-image"
-        output_path = Path(temp_dir) / "cover.avif"
-        _ = input_path.write_bytes(source)
-        source_info = probe_image(ffprobe_path, input_path)
-
-        fallback: CompressedCover | None = None
-        scale = 1.0
-
-        while True:
-            dimensions = scaled_dimensions(source_info, max_width, scale)
-            if (
-                scale < 1.0
-                and dimensions.width < MIN_DIMENSION
-                and dimensions.height < MIN_DIMENSION
-            ):
-                break
-
-            low = min_quality
-            high = MAX_QUALITY
-            best: tuple[bytes, int] | None = None
-            while low <= high:
-                quality = (low + high) // 2
-                encoded = encode_avif(
-                    ffmpeg_path,
-                    input_path,
-                    output_path,
-                    dimensions,
-                    quality,
-                )
-                if len(encoded) <= target_bytes:
-                    best = (encoded, quality)
-                    low = quality + 1
-                else:
-                    high = quality - 1
-
-            if best:
-                candidate = CompressedCover(
-                    data=best[0],
-                    quality=best[1],
-                    width=dimensions.width,
-                    height=dimensions.height,
-                )
-                if candidate.quality >= PREFERRED_MIN_QUALITY:
-                    return candidate
-                if (
-                    fallback is None
-                    or candidate.quality > fallback.quality
-                    or (
-                        candidate.quality == fallback.quality
-                        and candidate.width * candidate.height > fallback.width * fallback.height
+    def _supported_args(self) -> list[str]:
+        """Checks on a tiny image that FFmpeg can write AVIF, and drops the image tuning when its
+        libaom is too old for it."""
+        sample = ["-f", "lavfi", "-i", "color=gray:size=64x64", "-frames:v", "1"]
+        error = None
+        with tempfile.TemporaryDirectory(prefix="stash-cover-") as temp:
+            for args in ([*ENCODER, *IMAGE_TUNING], ENCODER):
+                try:
+                    run_ffmpeg(
+                        self.ffmpeg,
+                        *sample,
+                        *args,
+                        "-crf",
+                        "30",
+                        "-f",
+                        "avif",
+                        f"{temp}/check.avif",
                     )
-                ):
-                    fallback = candidate
+                    return args
+                except RuntimeError as exc:
+                    error = exc
+        raise RuntimeError(f"FFmpeg cannot encode AVIF with libaom-av1: {error}")
 
-            scale *= 0.9
+    def scale(self, source: Path, width: str) -> tuple[Path, int, int]:
+        """Decodes and scales the source into a lossless file next to it, so that each encode
+        only reads it, and returns the file and its dimensions."""
+        scaled = source.with_name("scaled.y4m")
+        filters = f"scale={width}:-2:flags=lanczos"
+        args = ["-i", str(source), "-frames:v", "1", "-vf", filters, "-pix_fmt", "yuv444p"]
+        run_ffmpeg(self.ffmpeg, *args, str(scaled))
+        # A Y4M file starts with a text header such as "YUV4MPEG2 W720 H1080 ...".
+        with scaled.open("rb") as file:
+            match = re.search(rb" W(\d+) H(\d+)", file.readline())
+        if not match:
+            raise RuntimeError("Could not read the dimensions of the scaled cover")
+        return scaled, int(match[1]), int(match[2])
 
-        if fallback:
-            return fallback
+    def encode(self, scaled: Path, crf: int) -> bytes:
+        output = scaled.with_name("cover.avif")
+        args = ["-i", str(scaled), "-frames:v", "1", *self.args, "-crf", str(crf)]
+        run_ffmpeg(self.ffmpeg, *args, "-pix_fmt", "yuv444p", "-f", "avif", str(output))
+        return output.read_bytes()
 
+
+def best_fit(encode: Callable[[int], bytes], target_bytes: int) -> tuple[int, bytes] | None:
+    """The lowest CRF up to MAX_CRF whose encoding fits, and that encoding.
+
+    A cover's size shrinks about exponentially with the CRF, so each guess interpolates between
+    the sizes seen so far. A search takes 3 or 4 encodes, where bisecting takes 5 or 6.
+    """
+    low, high = 0, MAX_CRF
+    sizes: dict[int, int] = {}
+    best: tuple[int, bytes] | None = None
+    crf = FIRST_GUESS_CRF
+    while True:
+        data = encode(crf)
+        sizes[crf] = len(data)
+        if len(data) <= target_bytes:
+            best, high = (crf, data), crf - 1
+        else:
+            low = crf + 1
+        if low > high:
+            return best
+        # Should the guesses keep missing, as for a cover whose size jumps, bisecting ends it.
+        guess = interpolate(sizes, target_bytes) if len(sizes) < 5 else (low + high) // 2
+        crf = min(max(guess, low), high)
+
+
+def interpolate(sizes: dict[int, int], target_bytes: int) -> int:
+    """The CRF at which the size would just reach the target, estimated from the two sizes seen
+    closest to it."""
+    fits = sorted(crf for crf, size in sizes.items() if size <= target_bytes)
+    too_big = sorted((crf for crf, size in sizes.items() if size > target_bytes), reverse=True)
+    pair = [too_big[0], fits[0]] if fits and too_big else fits[:2] or too_big[:2]
+    if len(pair) == 2:
+        low, high = sorted(pair)
+        ratio = math.pow(sizes[high] / sizes[low], 1 / (high - low))
+    else:
+        ratio = SIZE_RATIO_PER_CRF
+    start = fits[0] if fits else too_big[0]
+    if ratio >= 1:
+        return start + 1
+    return start + math.ceil(math.log(target_bytes / sizes[start]) / math.log(ratio))
+
+
+def compress_cover(encoder: Encoder, source: bytes, target_bytes: int) -> CompressedCover:
+    with tempfile.TemporaryDirectory(prefix="stash-cover-") as temp:
+        source_path = Path(temp) / "source"
+        _ = source_path.write_bytes(source)
+
+        scaled, width, height = encoder.scale(source_path, f"min({MAX_WIDTH}\\,iw)")
+        while True:
+            if fit := best_fit(partial(encoder.encode, scaled), target_bytes):
+                return CompressedCover(fit[1], fit[0], width, height)
+            next_width = round(width * 0.9)
+            if next_width < MIN_DIMENSION and height * 0.9 < MIN_DIMENSION:
+                break
+            scaled, width, height = encoder.scale(source_path, str(next_width - next_width % 2))
     raise RuntimeError(
-        f"Could not compress the cover to {target_bytes / 1024:.1f} KiB "
-        f"with minimum quality {min_quality} and minimum dimension {MIN_DIMENSION}px"
+        f"Could not compress the cover to {target_bytes / 1024:.1f} KiB at CRF {MAX_CRF} or "
+        f"better and at least {MIN_DIMENSION}px"
     )

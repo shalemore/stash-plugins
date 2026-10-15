@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from typing import cast
 
 import pytest
+import stash_plugin
 from graphql import build_schema, parse, validate
 from stash_plugin import Operation
 
@@ -26,7 +27,14 @@ def find_operations(value: object) -> Iterator[Operation[object]]:
             yield from find_operations(cast(object, getattr(value, field.name)))
 
 
+def module_operations(prefix: str, module: object) -> Iterator[tuple[str, Operation[object]]]:
+    for name, value in cast("dict[str, object]", vars(module)).items():
+        for index, operation in enumerate(find_operations(value)):
+            yield f"{prefix}:{name}[{index}]", operation
+
+
 def plugin_operations() -> Iterator[tuple[str, Operation[object]]]:
+    yield from module_operations("shared", stash_plugin)
     for api in sorted(PLUGINS_DIR.glob("*/stash_api.py")):
         plugin_id = api.parent.name
         # Each plugin has a module named stash_api, so each gets a unique name here.
@@ -34,9 +42,7 @@ def plugin_operations() -> Iterator[tuple[str, Operation[object]]]:
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for name, value in cast("dict[str, object]", vars(module)).items():
-            for index, operation in enumerate(find_operations(value)):
-                yield f"{plugin_id}:{name}[{index}]", operation
+        yield from module_operations(plugin_id, module)
 
 
 OPERATIONS = list(plugin_operations())
@@ -44,7 +50,7 @@ OPERATIONS = list(plugin_operations())
 
 def test_every_plugin_has_operations():
     plugins = {name.split(":")[0] for name, _ in OPERATIONS}
-    assert plugins == {api.parent.name for api in PLUGINS_DIR.glob("*/stash_api.py")}
+    assert plugins == {"shared"} | {api.parent.name for api in PLUGINS_DIR.glob("*/stash_api.py")}
 
 
 @pytest.mark.parametrize("operation", [op for _, op in OPERATIONS], ids=[n for n, _ in OPERATIONS])

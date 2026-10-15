@@ -1,15 +1,15 @@
 from stash_plugin import PluginInput, StashClient, as_bool, emit_info, emit_warn, run_plugin
-from sync_logic import Taxonomy, collect_targets, process_targets, select_target_galleries
-
-
-def log_items(prefix: str, items: list[dict[str, object]]) -> None:
-    for item in items:
-        emit_info(
-            f"{prefix}: gallery_id={item['id']} folder={item['path']} reason={item['reason']}"
-        )
 
 
 def run(plugin_input: PluginInput) -> object:
+    hook = plugin_input.hook
+    # Only galleries that a scan creates or updates are synced. Edits in the UI carry an input.
+    if hook and hook.input is not None:
+        return None
+
+    # Imported only now, so that the hooks of edits in the UI exit fast.
+    from sync_logic import Taxonomy, collect_targets, process_targets, select_target_galleries
+
     args = plugin_input.args
     client = StashClient.connect(plugin_input, timeout=30)
     dry_run = as_bool(args.get("dry_run"), False)
