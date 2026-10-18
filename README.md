@@ -16,6 +16,7 @@ In Stash, go to `Settings` -> `Plugins` -> `Available Plugins` -> `Add source`.
 - [E-Hentai Gallery Updater](plugins/eht-updater): fills gallery metadata from E-Hentai folder names.
 - [Extended Attributes](plugins/extended-attributes): enforces single-subtype attribute schemas and path-based defaults.
 - [IMDb Updater](plugins/imdb-updater): links scenes to IMDb groups and fills TV episode metadata.
+- [Watch Libraries](plugins/watch-libraries): scans new files in your libraries as they appear.
 
 ## License
 

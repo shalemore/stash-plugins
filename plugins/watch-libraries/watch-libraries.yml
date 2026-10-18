@@ -1,0 +1,30 @@
+name: Watch Libraries
+description: Scan new files in your libraries as they appear, instead of scanning whole libraries
+version: 0.1.0
+url: https://github.com/shalemore/stash-plugins
+
+exec:
+  - python3
+  - "{pluginDir}/main.py"
+
+interface: raw
+
+settings:
+  quiet_seconds:
+    displayName: Quiet time (seconds)
+    description: Scan once no new file has appeared for this long. Defaults to 10.
+    type: NUMBER
+  max_wait_seconds:
+    displayName: Longest wait (seconds)
+    description: Scan this long after the first new file even if files keep coming. Defaults to 120.
+    type: NUMBER
+
+tasks:
+  - name: Start watcher
+    description: Watch the libraries and scan new files as they appear
+    defaultArgs:
+      mode: start
+  - name: Stop watcher
+    description: Stop watching the libraries
+    defaultArgs:
+      mode: stop
