@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from types import ModuleType
+from typing import Protocol
 
 import pytest
 
@@ -68,6 +69,7 @@ def make_image(
 def make_settings(**overrides: object) -> object:
     values: dict[str, object] = {
         "gallery_tag_id": "99",
+        "source_tag_id": "99",
         "similarity_threshold": cluster.DEFAULT_SIMILARITY_THRESHOLD,
         "rating_step": 20,
     }
@@ -153,6 +155,15 @@ def test_select_candidates_requires_source_tag_description_and_ungrouped():
 
     selected = cluster.select_candidates([tagged, untagged, organized, no_details], "99")
     assert [img.id for img in selected] == ["1"]
+
+
+def test_split_tagged_members_drops_images_that_lost_the_source_tag():
+    kept = make_image("1", tag_ids=("99", "5"))
+    dropped = make_image("2", tag_ids=("5",))
+
+    members, untagged = cluster.split_tagged_members([kept, dropped], "99")
+    assert [image.id for image in members] == ["1"]
+    assert untagged == ["2"]
 
 
 def test_derive_gallery_metadata_uses_latest_title_and_earliest_date():
@@ -270,3 +281,112 @@ def test_cleanup_empty_galleries_respects_organized():
         performer_ids=(),
     )
     assert cluster._cleanup_empty_galleries(None, [g_empty, g_locked], dry_run=True) == 1
+
+
+class DocumentedOperation(Protocol):
+    document: str
+
+
+class FakeClient:
+    """Serves the gallery members and records the mutations the sync pass issues."""
+
+    def __init__(self, members: list[dict[str, object]]) -> None:
+        self.members: list[dict[str, object]] = members
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def execute(
+        self, operation: DocumentedOperation, variables: dict[str, object]
+    ) -> dict[str, object]:
+        document = operation.document
+        self.calls.append((document, variables))
+        if "findImages" in document:
+            return {"findImages": {"images": self.members}}
+        return {}
+
+    def called(self, mutation: str) -> list[dict[str, object]]:
+        return [variables for document, variables in self.calls if mutation in document]
+
+
+def make_raw_member(
+    image_id: str,
+    *,
+    details: str,
+    tags: tuple[str, ...],
+    gallery_id: str,
+    created_at: str = "2026-01-01T00:00:00Z",
+) -> dict[str, object]:
+    return {
+        "id": image_id,
+        "title": image_id,
+        "code": "",
+        "date": "",
+        "details": details,
+        "organized": False,
+        "created_at": created_at,
+        "rating100": None,
+        "visual_files": [],
+        "galleries": [{"id": gallery_id}],
+        "tags": [{"id": tag} for tag in tags],
+        "performers": [],
+        "studio": None,
+    }
+
+
+def make_gallery(image_count: int) -> object:
+    return stash_api.GalleryItem(
+        id="g1",
+        title="2026-01-01 10:00",
+        date="2026-01-01",
+        details="image description",
+        organized=False,
+        image_count=image_count,
+        rating100=None,
+        studio_id=None,
+        cover_id="1",
+        tag_ids=("99",),
+        performer_ids=(),
+    )
+
+
+def test_find_images_in_galleries_chunks_the_gallery_ids():
+    client = FakeClient([make_raw_member("1", details="Prompt", tags=("99",), gallery_id="g1")])
+
+    images = stash_api.find_images_in_galleries(client, [str(i) for i in range(1200)])
+
+    assert [image.id for image in images] == ["1"]
+    # 1200 gallery IDs are asked for in chunks of 500, so nothing loads Stash with one
+    # oversized query.
+    assert len(client.called("findImages")) == 3
+
+
+def test_sync_removes_members_that_lost_the_source_tag():
+    client = FakeClient(
+        [
+            make_raw_member("1", details="Kept prompt", tags=("99",), gallery_id="g1"),
+            make_raw_member("2", details="Dropped prompt", tags=("7",), gallery_id="g1"),
+        ]
+    )
+
+    updated, removed, destroyed = cluster._sync_all_managed_galleries(
+        client, [make_gallery(2)], make_settings(), dry_run=False
+    )
+
+    assert removed == 1
+    assert destroyed == 0
+    assert updated == 1
+    removals = client.called("removeGalleryImages")
+    assert [call["input"] for call in removals] == [{"gallery_id": "g1", "image_ids": ["2"]}]
+
+
+def test_sync_destroys_a_gallery_whose_members_all_lost_the_source_tag():
+    client = FakeClient(
+        [make_raw_member("1", details="Dropped prompt", tags=("7",), gallery_id="g1")]
+    )
+
+    updated, removed, destroyed = cluster._sync_all_managed_galleries(
+        client, [make_gallery(1)], make_settings(), dry_run=False
+    )
+
+    assert (updated, removed, destroyed) == (0, 1, 1)
+    assert len(client.called("removeGalleryImages")) == 1
+    assert len(client.called("galleryDestroy")) == 1

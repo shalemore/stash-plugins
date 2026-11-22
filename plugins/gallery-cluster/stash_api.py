@@ -1,11 +1,13 @@
 """GraphQL operations and typed helpers for the Gallery Cluster plugin."""
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import NotRequired, TypedDict
 
 from stash_plugin import Operation, StashClient, as_object
 
 PLUGIN_ID = "gallery-cluster"
+IMAGE_QUERY_CHUNK = 500
 
 
 class _TagRef(TypedDict):
@@ -248,6 +250,12 @@ ADD_GALLERY_IMAGES = Operation[object]("""
     }
 """)
 
+REMOVE_GALLERY_IMAGES = Operation[object]("""
+    mutation GalleryClusterRemoveImages($input: GalleryRemoveInput!) {
+      removeGalleryImages(input: $input)
+    }
+""")
+
 SET_GALLERY_COVER = Operation[object]("""
     mutation GalleryClusterSetCover($input: GallerySetCoverInput!) {
       setGalleryCover(input: $input)
@@ -362,11 +370,19 @@ def resolve_tag_id(client: StashClient, tag_ref: str, *, create_missing: bool) -
     return created["id"]
 
 
+def chunks(values: list[str], size: int = IMAGE_QUERY_CHUNK) -> Iterator[list[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
 def find_images_by_ids(client: StashClient, image_ids: list[str]) -> list[ImageItem]:
-    if not image_ids:
-        return []
-    data = client.execute(FIND_IMAGES, {"ids": image_ids, "filter": {"per_page": -1}})
-    return [_to_image_item(raw) for raw in data["findImages"]["images"]]
+    found: dict[str, ImageItem] = {}
+    for chunk in chunks(image_ids):
+        data = client.execute(FIND_IMAGES, {"ids": chunk, "filter": {"per_page": -1}})
+        for raw in data["findImages"]["images"]:
+            item = _to_image_item(raw)
+            found[item.id] = item
+    return list(found.values())
 
 
 def find_images_by_tag(client: StashClient, tag_id: str) -> list[ImageItem]:
@@ -381,16 +397,24 @@ def find_images_by_tag(client: StashClient, tag_id: str) -> list[ImageItem]:
 
 
 def find_images_in_galleries(client: StashClient, gallery_ids: list[str]) -> list[ImageItem]:
-    if not gallery_ids:
-        return []
-    data = client.execute(
-        FIND_IMAGES,
-        {
-            "imageFilter": {"galleries": {"value": gallery_ids, "modifier": "INCLUDES"}},
-            "filter": {"per_page": -1},
-        },
-    )
-    return [_to_image_item(raw) for raw in data["findImages"]["images"]]
+    """Members of every given gallery.
+
+    Chunked because a rebuild passes thousands of gallery IDs, and one query with all of
+    them keeps Stash busy for minutes.
+    """
+    found: dict[str, ImageItem] = {}
+    for chunk in chunks(gallery_ids):
+        data = client.execute(
+            FIND_IMAGES,
+            {
+                "imageFilter": {"galleries": {"value": chunk, "modifier": "INCLUDES"}},
+                "filter": {"per_page": -1},
+            },
+        )
+        for raw in data["findImages"]["images"]:
+            item = _to_image_item(raw)
+            found[item.id] = item
+    return list(found.values())
 
 
 def find_managed_galleries(client: StashClient, tag_id: str) -> list[GalleryItem]:
@@ -475,6 +499,15 @@ def add_gallery_images(client: StashClient, gallery_id: str, image_ids: list[str
         return
     _ = client.execute(
         ADD_GALLERY_IMAGES,
+        {"input": {"gallery_id": gallery_id, "image_ids": image_ids}},
+    )
+
+
+def remove_gallery_images(client: StashClient, gallery_id: str, image_ids: list[str]) -> None:
+    if not image_ids:
+        return
+    _ = client.execute(
+        REMOVE_GALLERY_IMAGES,
         {"input": {"gallery_id": gallery_id, "image_ids": image_ids}},
     )
 

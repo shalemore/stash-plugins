@@ -21,7 +21,7 @@ Configure these in **Stash → Settings → Plugins → Gallery Cluster**:
   - `studio` from the images, only when all of them share one studio; a gallery loses its studio when they disagree
   - `rating` from the average of the ratings that exist, rounded to the step the UI can show (20 for whole stars, 10 for half stars, 5 for quarter stars, 10 for a 10-point scale, 1 for percent)
 - **Manual lock (`organized`)**: Images or galleries marked `organized` are left untouched by automatic clustering and metadata syncing.
-- **Cleanup (`Image.Destroy.Post`, `Gallery.Update.Post`)**: Updates remaining gallery metadata when images are removed, and deletes unorganized managed galleries that reach `0` images.
+- **Cleanup (`Image.Destroy.Post`, `Gallery.Update.Post`)**: Drops images that no longer carry the source tag from their managed gallery, then deletes unorganized managed galleries that end up with `0` images.
 
 ## Tasks
 

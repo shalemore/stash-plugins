@@ -18,6 +18,7 @@ from stash_api import (
     find_images_in_galleries,
     find_managed_galleries,
     get_configuration,
+    remove_gallery_images,
     resolve_tag_id,
     set_gallery_cover,
     update_gallery,
@@ -52,9 +53,10 @@ class ClusterConfig:
 
 @dataclass(frozen=True)
 class ClusterSettings:
-    """Resolved values a sync pass needs: gallery tag ID, matching threshold, rating step."""
+    """Resolved values a sync pass needs."""
 
     gallery_tag_id: str
+    source_tag_id: str
     similarity_threshold: float
     rating_step: int
 
@@ -102,6 +104,20 @@ def select_candidates(images: list[ImageItem], tag_id: str) -> list[ImageItem]:
     return [
         img for img in images if tag_id in img.tag_ids and not img.organized and bool(img.details)
     ]
+
+
+def split_tagged_members(
+    images: list[ImageItem], source_tag_id: str
+) -> tuple[list[ImageItem], list[str]]:
+    """Split members into the ones still carrying the source tag and the IDs that lost it."""
+    kept: list[ImageItem] = []
+    dropped: list[str] = []
+    for image in images:
+        if source_tag_id in image.tag_ids:
+            kept.append(image)
+        else:
+            dropped.append(image.id)
+    return kept, dropped
 
 
 def image_sort_key(image: ImageItem) -> tuple[int, int, str, int]:
@@ -311,6 +327,13 @@ def _assign_images_to_clusters(
 ) -> dict[str, int]:
     """Match ungrouped candidate images to existing galleries or create new ones."""
     managed_ids = {g.id for g in managed_galleries}
+    to_process = sorted(
+        (img for img in candidates if not any(gid in managed_ids for gid in img.gallery_ids)),
+        key=image_sort_key,
+    )
+    if not to_process:
+        return {"evaluated": 0, "joined": 0, "created": 0, "updated": 0}
+
     buckets: dict[str, _ClusterBucket] = {}
     matcher = DescriptionMatcher(settings.similarity_threshold)
 
@@ -318,6 +341,10 @@ def _assign_images_to_clusters(
     images_by_gallery: dict[str, list[ImageItem]] = {gid: [] for gid in active_gallery_ids}
     if active_gallery_ids:
         for img in find_images_in_galleries(client, active_gallery_ids):
+            # Members that lost the source tag are dropped by the sync pass, so leave them
+            # out of the metadata of galleries this pass rewrites.
+            if settings.source_tag_id not in img.tag_ids:
+                continue
             for gid in img.gallery_ids:
                 if gid in images_by_gallery:
                     images_by_gallery[gid].append(img)
@@ -330,12 +357,7 @@ def _assign_images_to_clusters(
         if not gallery.organized and gallery.details:
             matcher.add(gallery.id, gallery.details)
 
-    to_process = sorted(
-        (img for img in candidates if not any(gid in managed_ids for gid in img.gallery_ids)),
-        key=image_sort_key,
-    )
-
-    progress = Progress(len(to_process)) if report_progress and to_process else None
+    progress = Progress(len(to_process)) if report_progress else None
     joined = 0
     created = 0
     pending_adds: dict[str, list[str]] = {}
@@ -415,11 +437,15 @@ def _sync_all_managed_galleries(
     *,
     dry_run: bool,
     report_progress: bool = False,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
+    """Enforce membership by the source tag, then refresh metadata.
+
+    Returns `(updated, removed, destroyed)`.
+    """
     destroyed = _cleanup_empty_galleries(client, managed_galleries, dry_run=dry_run)
     non_empty = [g for g in managed_galleries if g.image_count > 0 and not g.organized]
     if not non_empty:
-        return 0, destroyed
+        return 0, 0, destroyed
 
     images_by_gallery: dict[str, list[ImageItem]] = {g.id: [] for g in non_empty}
     for img in find_images_in_galleries(client, [g.id for g in non_empty]):
@@ -429,19 +455,26 @@ def _sync_all_managed_galleries(
 
     progress = Progress(len(non_empty)) if report_progress else None
     updated = 0
+    removed = 0
     for gallery in non_empty:
-        imgs = images_by_gallery.get(gallery.id, [])
-        if not imgs:
+        members, untagged = split_tagged_members(
+            images_by_gallery.get(gallery.id, []), settings.source_tag_id
+        )
+        if untagged:
+            removed += len(untagged)
+            if not dry_run:
+                remove_gallery_images(client, gallery.id, untagged)
+        if not members:
             if not dry_run:
                 destroy_galleries(client, [gallery.id])
             destroyed += 1
         else:
-            bucket = _ClusterBucket(gallery=gallery, images=imgs)
-            if _sync_gallery_fields(client, bucket, settings, dry_run=dry_run):
+            bucket = _ClusterBucket(gallery=gallery, images=members)
+            if _sync_gallery_fields(client, bucket, settings, dry_run=dry_run) or untagged:
                 updated += 1
         if progress:
             progress.step()
-    return updated, destroyed
+    return updated, removed, destroyed
 
 
 def run_cluster(
@@ -483,63 +516,76 @@ def run_cluster(
 
     cluster_settings = ClusterSettings(
         gallery_tag_id=tag_id,
+        source_tag_id=source_tag_id,
         similarity_threshold=config.similarity_threshold,
         rating_step=config.rating_step,
     )
 
     if entity_type == "image" and item_ids is not None:
         images = find_images_by_ids(client, item_ids)
-        candidates = select_candidates(images, source_tag_id)
-        if not candidates:
-            return {"dry_run": dry_run, "evaluated": 0, "joined": 0, "created": 0, "updated": 0}
-
         managed = find_managed_galleries(client, tag_id)
-        stats = _assign_images_to_clusters(
-            client,
-            candidates,
-            managed,
-            cluster_settings,
-            dry_run=dry_run,
+
+        # An image that already belongs to a managed gallery changes that gallery, and an
+        # image that lost the source tag has to leave it, so resync those galleries even
+        # when the image is not a clustering candidate.
+        affected = [g for g in managed if any(g.id in img.gallery_ids for img in images)]
+        resynced, removed, destroyed = (
+            _sync_all_managed_galleries(client, affected, cluster_settings, dry_run=dry_run)
+            if affected
+            else (0, 0, 0)
         )
 
-        # An image that already belongs to a managed gallery changes that gallery's derived
-        # fields, so resync the galleries it is in even when it is not a clustering candidate.
-        affected = [g for g in managed if any(g.id in img.gallery_ids for img in images)]
-        resynced = 0
-        if affected:
-            resynced, _ = _sync_all_managed_galleries(
-                client, affected, cluster_settings, dry_run=dry_run
+        candidates = select_candidates(images, source_tag_id)
+        stats = (
+            _assign_images_to_clusters(
+                client,
+                candidates,
+                managed,
+                cluster_settings,
+                dry_run=dry_run,
             )
+            if candidates
+            else {"evaluated": 0, "joined": 0, "created": 0, "updated": 0}
+        )
 
         emit_info(
             f"Gallery Cluster: evaluated {stats['evaluated']} images, "
             f"joined {stats['joined']} into existing galleries, "
             f"created {stats['created']} new galleries, "
-            f"updated {stats['updated'] + resynced} galleries."
+            f"updated {stats['updated'] + resynced} galleries, "
+            f"removed {removed} untagged images, destroyed {destroyed} empty galleries."
         )
-        return {"dry_run": dry_run, **stats, "updated": stats["updated"] + resynced}
+        return {
+            "dry_run": dry_run,
+            **stats,
+            "updated": stats["updated"] + resynced,
+            "removed": removed,
+            "destroyed": destroyed,
+        }
 
     if entity_type == "gallery" and item_ids is not None:
         galleries = [g for g in find_galleries_by_ids(client, item_ids) if tag_id in g.tag_ids]
         if not galleries:
-            return {"dry_run": dry_run, "updated": 0, "destroyed": 0}
-        updated, destroyed = _sync_all_managed_galleries(
+            return {"dry_run": dry_run, "updated": 0, "removed": 0, "destroyed": 0}
+        updated, removed, destroyed = _sync_all_managed_galleries(
             client, galleries, cluster_settings, dry_run=dry_run
         )
         emit_info(
-            f"Gallery Cluster: updated {updated} galleries, destroyed {destroyed} empty galleries."
+            f"Gallery Cluster: updated {updated} galleries, removed {removed} untagged images, "
+            f"destroyed {destroyed} empty galleries."
         )
-        return {"dry_run": dry_run, "updated": updated, "destroyed": destroyed}
+        return {"dry_run": dry_run, "updated": updated, "removed": removed, "destroyed": destroyed}
 
     if entity_type == "image_destroy":
         managed = find_managed_galleries(client, tag_id)
-        updated, destroyed = _sync_all_managed_galleries(
+        updated, removed, destroyed = _sync_all_managed_galleries(
             client, managed, cluster_settings, dry_run=dry_run
         )
         emit_info(
-            f"Gallery Cluster: updated {updated} galleries, destroyed {destroyed} empty galleries."
+            f"Gallery Cluster: updated {updated} galleries, removed {removed} untagged images, "
+            f"destroyed {destroyed} empty galleries."
         )
-        return {"dry_run": dry_run, "updated": updated, "destroyed": destroyed}
+        return {"dry_run": dry_run, "updated": updated, "removed": removed, "destroyed": destroyed}
 
     # Full Rebuild / Dry Run task
     emit_info("Gallery Cluster: loading tagged images and managed galleries...")
@@ -547,7 +593,6 @@ def run_cluster(
     matched_images = len(candidates)
 
     managed = find_managed_galleries(client, tag_id)
-    cleaned_empty = _cleanup_empty_galleries(client, managed, dry_run=dry_run)
     remaining_managed = [g for g in managed if g.image_count > 0 or g.organized]
 
     assign_stats = _assign_images_to_clusters(
@@ -559,14 +604,12 @@ def run_cluster(
         report_progress=True,
     )
 
-    # Refresh managed galleries once to sync any existing gallery whose metadata drifted.
-    if not dry_run:
-        refreshed = find_managed_galleries(client, tag_id)
-        synced_updated, extra_destroyed = _sync_all_managed_galleries(
-            client, refreshed, cluster_settings, dry_run=False
-        )
-    else:
-        synced_updated, extra_destroyed = 0, 0
+    # Sync every managed gallery once: delete the empty ones, drop members that lost the
+    # source tag, and refresh the metadata that drifted.
+    refreshed = find_managed_galleries(client, tag_id)
+    synced_updated, removed, destroyed = _sync_all_managed_galleries(
+        client, refreshed, cluster_settings, dry_run=dry_run
+    )
 
     emit_progress(1.0)
     summary = {
@@ -575,14 +618,16 @@ def run_cluster(
         "evaluated": assign_stats["evaluated"],
         "joined": assign_stats["joined"],
         "created": assign_stats["created"],
-        "updated": max(assign_stats["updated"], synced_updated),
-        "destroyed": cleaned_empty + extra_destroyed,
+        "updated": assign_stats["updated"] + synced_updated,
+        "removed": removed,
+        "destroyed": destroyed,
     }
     mode = "dry run" if dry_run else "rebuild"
     emit_info(
         f"Gallery Cluster {mode}: matched {summary['matched_images']} tagged images, "
         f"evaluated {summary['evaluated']}, joined {summary['joined']} into existing galleries, "
         f"created {summary['created']} new galleries, updated {summary['updated']} galleries, "
+        f"removed {summary['removed']} untagged images, "
         f"destroyed {summary['destroyed']} empty galleries."
     )
     return summary
