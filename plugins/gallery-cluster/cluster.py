@@ -1,0 +1,476 @@
+"""Core clustering, gallery metadata synchronization, and lifecycle cleanup."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from similarity import DescriptionMatcher
+from stash_api import (
+    GalleryItem,
+    ImageItem,
+    add_gallery_images,
+    create_gallery,
+    destroy_galleries,
+    find_galleries_by_ids,
+    find_images_by_ids,
+    find_images_by_prefix,
+    find_images_in_galleries,
+    find_managed_galleries,
+    get_plugin_settings,
+    resolve_tag_id,
+    set_gallery_cover,
+    update_gallery,
+)
+from stash_plugin import (
+    PluginInput,
+    Progress,
+    StashClient,
+    as_str,
+    emit_info,
+    emit_progress,
+    emit_warn,
+)
+
+DEFAULT_SIMILARITY_THRESHOLD = 0.85
+EPOCH_RE = re.compile(r"^\d{10,13}$")
+TITLE_DATETIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)")
+DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+@dataclass(frozen=True)
+class ClusterConfig:
+    path_prefixes: tuple[str, ...]
+    gallery_tag: str
+    similarity_threshold: float
+
+
+def parse_config(settings: dict[str, object]) -> ClusterConfig:
+    raw_prefixes = as_str(settings.get("path_prefixes")) or ""
+    prefixes = tuple(
+        part.strip()
+        for part in re.split(r"[,;\r\n]+", raw_prefixes)
+        if part.strip()
+    )
+    gallery_tag = (as_str(settings.get("gallery_tag")) or "").strip()
+
+    raw_threshold = settings.get("similarity_threshold")
+    threshold = DEFAULT_SIMILARITY_THRESHOLD
+    if raw_threshold is not None and raw_threshold != "":
+        try:
+            parsed = (
+                float(raw_threshold)
+                if isinstance(raw_threshold, int | float | str)
+                else float(str(raw_threshold))
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"similarity_threshold must be a number; received: {raw_threshold}"
+            ) from exc
+        if not 0.0 < parsed <= 1.0:
+            raise ValueError(
+                f"similarity_threshold must be in (0, 1]; received: {parsed}"
+            )
+        threshold = parsed
+
+    return ClusterConfig(
+        path_prefixes=prefixes,
+        gallery_tag=gallery_tag,
+        similarity_threshold=threshold,
+    )
+
+
+def matches_any_prefix(paths: tuple[str, ...], prefixes: tuple[str, ...]) -> bool:
+    return any(path.startswith(prefix) for path in paths for prefix in prefixes)
+
+
+def image_sort_key(image: ImageItem) -> tuple[int, int, str, int]:
+    """Chronological sort key: numeric epoch code -> title datetime -> date -> created_at -> id."""
+    try:
+        numeric_id = int(image.id)
+    except ValueError:
+        numeric_id = 0
+
+    if EPOCH_RE.fullmatch(image.code):
+        epoch = int(image.code)
+        if len(image.code) == 10:
+            epoch *= 1000
+        return (0, epoch, "", numeric_id)
+
+    if match := TITLE_DATETIME_RE.match(image.title):
+        return (1, 0, match.group(1).replace("T", " "), numeric_id)
+
+    if image.date:
+        return (2, 0, image.date, numeric_id)
+
+    if image.created_at:
+        return (3, 0, image.created_at, numeric_id)
+
+    return (4, 0, "", numeric_id)
+
+
+def _extract_date(image: ImageItem) -> str:
+    if image.date:
+        return image.date
+    if match := DATE_PREFIX_RE.match(image.title):
+        return match.group(1)
+    if len(image.created_at) >= 10:
+        return image.created_at[:10]
+    return ""
+
+
+def _extract_title(image: ImageItem) -> str:
+    if image.title:
+        return image.title
+    if image.date:
+        return image.date
+    if len(image.created_at) >= 16:
+        return image.created_at[:16].replace("T", " ")
+    return image.id
+
+
+def derive_gallery_metadata(images: list[ImageItem]) -> tuple[str, str, str]:
+    """Return `(title, date, cover_image_id)` from a non-empty list of images.
+
+    - `title` follows the earliest image's title (creation timestamp).
+    - `date` follows the latest image's date (most recent activity).
+    - `cover_image_id` is the earliest image's ID.
+    """
+    ordered = sorted(images, key=image_sort_key)
+    earliest = ordered[0]
+    latest = ordered[-1]
+    return _extract_title(earliest), _extract_date(latest), earliest.id
+
+
+@dataclass
+class _ClusterBucket:
+    gallery: GalleryItem
+    images: list[ImageItem]
+    is_new: bool = False
+
+
+def _sync_gallery_fields(
+    client: StashClient,
+    bucket: _ClusterBucket,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Update gallery title, date, details, and cover if out of sync. Returns whether changed."""
+    if bucket.gallery.organized or not bucket.images:
+        return False
+
+    desired_title, desired_date, desired_cover = derive_gallery_metadata(bucket.images)
+    desired_details: str | None = None
+    if not bucket.gallery.details:
+        for img in sorted(bucket.images, key=image_sort_key):
+            if img.details:
+                desired_details = img.details
+                break
+
+    update_title = desired_title if bucket.gallery.title != desired_title else None
+    update_date = desired_date if desired_date and bucket.gallery.date != desired_date else None
+    need_cover = bucket.gallery.cover_id != desired_cover
+
+    if update_title is None and update_date is None and desired_details is None and not need_cover:
+        return False
+
+    if not dry_run:
+        if update_title is not None or update_date is not None or desired_details is not None:
+            update_gallery(
+                client,
+                gallery_id=bucket.gallery.id,
+                title=update_title,
+                date=update_date,
+                details=desired_details,
+            )
+        if need_cover:
+            set_gallery_cover(client, bucket.gallery.id, desired_cover)
+
+    if update_title is not None:
+        bucket.gallery.title = update_title
+    if update_date is not None:
+        bucket.gallery.date = update_date
+    if desired_details is not None:
+        bucket.gallery.details = desired_details
+    if need_cover:
+        bucket.gallery.cover_id = desired_cover
+    return True
+
+
+def _cleanup_empty_galleries(
+    client: StashClient,
+    galleries: list[GalleryItem],
+    *,
+    dry_run: bool,
+) -> int:
+    empty_ids = [g.id for g in galleries if g.image_count == 0 and not g.organized]
+    if empty_ids and not dry_run:
+        destroy_galleries(client, empty_ids)
+    return len(empty_ids)
+
+
+def _assign_images_to_clusters(
+    client: StashClient,
+    candidates: list[ImageItem],
+    managed_galleries: list[GalleryItem],
+    tag_id: str,
+    threshold: float,
+    *,
+    dry_run: bool,
+    report_progress: bool = False,
+) -> dict[str, int]:
+    """Match ungrouped candidate images to existing galleries or create new ones."""
+    managed_ids = {g.id for g in managed_galleries}
+    buckets: dict[str, _ClusterBucket] = {}
+    matcher = DescriptionMatcher(threshold)
+
+    active_gallery_ids = [g.id for g in managed_galleries if g.image_count > 0]
+    images_by_gallery: dict[str, list[ImageItem]] = {gid: [] for gid in active_gallery_ids}
+    if active_gallery_ids:
+        for img in find_images_in_galleries(client, active_gallery_ids):
+            for gid in img.gallery_ids:
+                if gid in images_by_gallery:
+                    images_by_gallery[gid].append(img)
+
+    for gallery in managed_galleries:
+        if gallery.image_count <= 0:
+            continue
+        bucket = _ClusterBucket(gallery=gallery, images=images_by_gallery.get(gallery.id, []))
+        buckets[gallery.id] = bucket
+        if not gallery.organized and gallery.details:
+            matcher.add(gallery.id, gallery.details)
+
+    to_process = sorted(
+        (
+            img
+            for img in candidates
+            if not img.organized
+            and bool(img.details)
+            and not any(gid in managed_ids for gid in img.gallery_ids)
+        ),
+        key=image_sort_key,
+    )
+
+    progress = Progress(len(to_process)) if report_progress and to_process else None
+    joined = 0
+    created = 0
+    pending_adds: dict[str, list[str]] = {}
+    touched_buckets: set[str] = set()
+    synthetic_counter = 0
+
+    for img in to_process:
+        match = matcher.find_best(img.details)
+        if match is not None:
+            target_id, _score = match
+            bucket = buckets[target_id]
+            bucket.images.append(img)
+            bucket.gallery.image_count += 1
+            pending_adds.setdefault(target_id, []).append(img.id)
+            touched_buckets.add(target_id)
+            joined += 1
+        else:
+            title = _extract_title(img)
+            date = _extract_date(img)
+            if dry_run:
+                synthetic_counter += 1
+                new_id = f"dry-run-{synthetic_counter}"
+            else:
+                new_id = create_gallery(
+                    client,
+                    title=title,
+                    date=date,
+                    details=img.details,
+                    tag_id=tag_id,
+                )
+                add_gallery_images(client, new_id, [img.id])
+                set_gallery_cover(client, new_id, img.id)
+
+            new_gallery = GalleryItem(
+                id=new_id,
+                title=title,
+                date=date,
+                details=img.details,
+                organized=False,
+                image_count=1,
+                cover_id=img.id,
+                tag_ids=(tag_id,),
+            )
+            buckets[new_id] = _ClusterBucket(gallery=new_gallery, images=[img], is_new=True)
+            matcher.add(new_id, img.details)
+            created += 1
+
+        if progress:
+            progress.step()
+
+    if not dry_run:
+        for gallery_id, image_ids in pending_adds.items():
+            add_gallery_images(client, gallery_id, image_ids)
+
+    updated = 0
+    for gallery_id in touched_buckets:
+        if _sync_gallery_fields(client, buckets[gallery_id], dry_run=dry_run):
+            updated += 1
+
+    return {
+        "evaluated": len(to_process),
+        "joined": joined,
+        "created": created,
+        "updated": updated,
+    }
+
+
+def _sync_all_managed_galleries(
+    client: StashClient,
+    managed_galleries: list[GalleryItem],
+    *,
+    dry_run: bool,
+    report_progress: bool = False,
+) -> tuple[int, int]:
+    destroyed = _cleanup_empty_galleries(client, managed_galleries, dry_run=dry_run)
+    non_empty = [g for g in managed_galleries if g.image_count > 0 and not g.organized]
+    if not non_empty:
+        return 0, destroyed
+
+    images_by_gallery: dict[str, list[ImageItem]] = {g.id: [] for g in non_empty}
+    for img in find_images_in_galleries(client, [g.id for g in non_empty]):
+        for gid in img.gallery_ids:
+            if gid in images_by_gallery:
+                images_by_gallery[gid].append(img)
+
+    progress = Progress(len(non_empty)) if report_progress else None
+    updated = 0
+    for gallery in non_empty:
+        imgs = images_by_gallery.get(gallery.id, [])
+        if not imgs:
+            if not dry_run:
+                destroy_galleries(client, [gallery.id])
+            destroyed += 1
+        else:
+            bucket = _ClusterBucket(gallery=gallery, images=imgs)
+            if _sync_gallery_fields(client, bucket, dry_run=dry_run):
+                updated += 1
+        if progress:
+            progress.step()
+    return updated, destroyed
+
+
+def run_cluster(
+    plugin_input: PluginInput,
+    *,
+    dry_run: bool,
+    entity_type: str | None,
+    item_ids: list[str] | None,
+) -> object:
+    client = StashClient.connect(plugin_input)
+    settings = get_plugin_settings(client)
+    config = parse_config(settings)
+
+    if not config.path_prefixes or not config.gallery_tag:
+        message = (
+            "Skipped: configure both 'Path prefixes' and 'Gallery tag' in Plugin Settings first."
+        )
+        if entity_type is None:
+            emit_warn(message)
+        else:
+            emit_info(message)
+        return {"dry_run": dry_run, "skipped_unconfigured": True}
+
+    tag_id = resolve_tag_id(client, config.gallery_tag, create_missing=not dry_run)
+    if tag_id is None:
+        message = f"Skipped: gallery tag {config.gallery_tag!r} does not exist yet."
+        if entity_type is None:
+            emit_warn(message)
+        else:
+            emit_info(message)
+        return {"dry_run": dry_run, "missing_tag": config.gallery_tag}
+
+    if entity_type == "image" and item_ids is not None:
+        images = find_images_by_ids(client, item_ids)
+        matching = [
+            img
+            for img in images
+            if not img.organized
+            and bool(img.details)
+            and matches_any_prefix(img.paths, config.path_prefixes)
+        ]
+        if not matching:
+            return {"dry_run": dry_run, "evaluated": 0, "joined": 0, "created": 0}
+
+        managed = find_managed_galleries(client, tag_id)
+        stats = _assign_images_to_clusters(
+            client,
+            matching,
+            managed,
+            tag_id,
+            config.similarity_threshold,
+            dry_run=dry_run,
+        )
+        emit_info(
+            f"Gallery Cluster (image hook): evaluated={stats['evaluated']} "
+            f"joined={stats['joined']} created={stats['created']} updated={stats['updated']}"
+        )
+        return {"dry_run": dry_run, **stats}
+
+    if entity_type == "gallery" and item_ids is not None:
+        galleries = [
+            g for g in find_galleries_by_ids(client, item_ids) if tag_id in g.tag_ids
+        ]
+        if not galleries:
+            return {"dry_run": dry_run, "updated": 0, "destroyed": 0}
+        updated, destroyed = _sync_all_managed_galleries(client, galleries, dry_run=dry_run)
+        emit_info(
+            f"Gallery Cluster (gallery hook): updated={updated} destroyed={destroyed}"
+        )
+        return {"dry_run": dry_run, "updated": updated, "destroyed": destroyed}
+
+    if entity_type == "image_destroy":
+        managed = find_managed_galleries(client, tag_id)
+        updated, destroyed = _sync_all_managed_galleries(client, managed, dry_run=dry_run)
+        emit_info(
+            f"Gallery Cluster (destroy hook): updated={updated} destroyed={destroyed}"
+        )
+        return {"dry_run": dry_run, "updated": updated, "destroyed": destroyed}
+
+    # Full Rebuild / Dry Run task
+    emit_info("Gallery Cluster: loading matching images and managed galleries...")
+    by_id: dict[str, ImageItem] = {}
+    for prefix in config.path_prefixes:
+        for img in find_images_by_prefix(client, prefix):
+            if matches_any_prefix(img.paths, config.path_prefixes):
+                by_id[img.id] = img
+
+    managed = find_managed_galleries(client, tag_id)
+    cleaned_empty = _cleanup_empty_galleries(client, managed, dry_run=dry_run)
+    remaining_managed = [g for g in managed if g.image_count > 0 or g.organized]
+
+    assign_stats = _assign_images_to_clusters(
+        client,
+        list(by_id.values()),
+        remaining_managed,
+        tag_id,
+        config.similarity_threshold,
+        dry_run=dry_run,
+        report_progress=True,
+    )
+
+    # Refresh managed galleries once to sync any existing gallery whose metadata drifted.
+    if not dry_run:
+        refreshed = find_managed_galleries(client, tag_id)
+        synced_updated, extra_destroyed = _sync_all_managed_galleries(
+            client, refreshed, dry_run=False
+        )
+    else:
+        synced_updated, extra_destroyed = 0, 0
+
+    emit_progress(1.0)
+    summary = {
+        "dry_run": dry_run,
+        "matched_images": len(by_id),
+        "evaluated": assign_stats["evaluated"],
+        "joined": assign_stats["joined"],
+        "created": assign_stats["created"],
+        "updated": max(assign_stats["updated"], synced_updated),
+        "destroyed": cleaned_empty + extra_destroyed,
+    }
+    emit_info(f"Gallery Cluster summary: {summary}")
+    return summary
