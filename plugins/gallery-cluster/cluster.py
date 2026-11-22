@@ -659,6 +659,9 @@ def run_cluster(
             if affected
             else (0, 0, 0)
         )
+        # Stash fires no hook when images are removed from a gallery in the UI, so an empty
+        # gallery can survive until something else touches it. Sweep those here.
+        destroyed += _cleanup_empty_galleries(client, managed, dry_run=dry_run)
 
         candidates = select_candidates(images, source_tag_id)
         stats = (
