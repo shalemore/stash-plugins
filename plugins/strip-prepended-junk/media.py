@@ -45,14 +45,20 @@ class PrependedPrefix:
 
 def find_prepended_prefix(path: Path) -> PrependedPrefix | None:
     """The prefix hiding a stream, or None when the file already starts with one."""
+    header_bytes = TS_PACKET_SIZE * SYNC_RUN
     with path.open("rb") as handle:
-        head = handle.read(PREFIX_SCAN_BYTES)
-    if all(head[index * TS_PACKET_SIZE] == SYNC_BYTE for index in range(SYNC_RUN)):
-        return None
-    last_start = len(head) - TS_PACKET_SIZE * (SYNC_RUN - 1)
+        head = handle.read(header_bytes)
+        if len(head) < header_bytes:
+            return None
+        if all(head[index * TS_PACKET_SIZE] == SYNC_BYTE for index in range(SYNC_RUN)):
+            return None
+        # Only a file that does not start with the stream needs the wider scan.
+        _ = handle.seek(0)
+        window = handle.read(PREFIX_SCAN_BYTES)
+    last_start = len(window) - TS_PACKET_SIZE * (SYNC_RUN - 1)
     for offset in range(1, max(1, last_start)):
-        if all(head[offset + index * TS_PACKET_SIZE] == SYNC_BYTE for index in range(SYNC_RUN)):
-            return PrependedPrefix(length=offset, signature=head[:offset])
+        if all(window[offset + index * TS_PACKET_SIZE] == SYNC_BYTE for index in range(SYNC_RUN)):
+            return PrependedPrefix(length=offset, signature=window[:offset])
     return None
 
 

@@ -1,6 +1,6 @@
 name: Strip Prepended Junk
 description: Remove the image or stray bytes a downloader put in front of a scene's video stream
-version: 0.1.0
+version: 0.1.1
 
 url: https://github.com/shalemore/stash-plugins
 
