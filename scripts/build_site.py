@@ -74,7 +74,9 @@ def build(output: Path, plugins: list[Plugin], tags: set[str]) -> None:
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
             }
         )
-    index_yaml = yaml.safe_dump(index, sort_keys=False, allow_unicode=True)
+    index_yaml = yaml.safe_dump(  # pyright: ignore[reportUnknownMemberType]
+        index, sort_keys=False, allow_unicode=True
+    )
     _ = (output / "index.yml").write_text(index_yaml, encoding="utf-8", newline="\n")
 
 
