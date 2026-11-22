@@ -1,5 +1,13 @@
 import pytest
-from stash_plugin import HookContext, PluginInput, StashClient, as_bool, emit_warn, graphql_url
+from stash_plugin import (
+    HookContext,
+    PluginInput,
+    Progress,
+    StashClient,
+    as_bool,
+    emit_warn,
+    graphql_url,
+)
 
 
 def plugin_input(args: dict[str, object]) -> PluginInput:
@@ -55,3 +63,44 @@ def test_client_resolves_paths_against_the_stash_address():
 def test_every_line_of_a_log_message_carries_its_level(capsys: pytest.CaptureFixture[str]):
     emit_warn("first\nsecond")
     assert capsys.readouterr().err == "\x01w\x02first\n\x01w\x02second\n"
+
+
+def test_progress_logs_the_step_at_every_five_percent(capsys: pytest.CaptureFixture[str]):
+    progress = Progress(20, label="Gallery Cluster: clustering images")
+    for _ in range(20):
+        progress.step()
+
+    logged = [
+        line.split("\x02", 1)[1]
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("\x01i\x02")
+    ]
+    assert logged == [
+        "Gallery Cluster: clustering images 1/20 (5%)",
+        "Gallery Cluster: clustering images 2/20 (10%)",
+        "Gallery Cluster: clustering images 3/20 (15%)",
+        "Gallery Cluster: clustering images 4/20 (20%)",
+        "Gallery Cluster: clustering images 5/20 (25%)",
+        "Gallery Cluster: clustering images 6/20 (30%)",
+        "Gallery Cluster: clustering images 7/20 (35%)",
+        "Gallery Cluster: clustering images 8/20 (40%)",
+        "Gallery Cluster: clustering images 9/20 (45%)",
+        "Gallery Cluster: clustering images 10/20 (50%)",
+        "Gallery Cluster: clustering images 11/20 (55%)",
+        "Gallery Cluster: clustering images 12/20 (60%)",
+        "Gallery Cluster: clustering images 13/20 (65%)",
+        "Gallery Cluster: clustering images 14/20 (70%)",
+        "Gallery Cluster: clustering images 15/20 (75%)",
+        "Gallery Cluster: clustering images 16/20 (80%)",
+        "Gallery Cluster: clustering images 17/20 (85%)",
+        "Gallery Cluster: clustering images 18/20 (90%)",
+        "Gallery Cluster: clustering images 19/20 (95%)",
+        "Gallery Cluster: clustering images 20/20 (100%)",
+    ]
+
+
+def test_progress_without_a_label_stays_quiet(capsys: pytest.CaptureFixture[str]):
+    progress = Progress(3)
+    for _ in range(3):
+        progress.step()
+    assert "\x01i\x02" not in capsys.readouterr().err

@@ -54,15 +54,27 @@ def emit_progress(progress: float) -> None:
 
 
 class Progress:
-    """Reports to Stash how many of the total steps are done."""
+    """Reports to Stash how many of the total steps are done.
 
-    def __init__(self, total: int) -> None:
-        self.total: int = total
+    With a `label`, it also logs `label: done/total (percent)` at every 5% mark, so a long
+    run shows where it is in the task log instead of only moving the progress bar.
+    """
+
+    LOG_EVERY_PERCENT: int = 5
+
+    def __init__(self, total: int, *, label: str | None = None) -> None:
+        self.total: int = max(total, 1)
         self.done: int = 0
+        self.label: str | None = label
+        self.logged_percent: int = 0
 
     def step(self) -> None:
         self.done += 1
         emit_progress(self.done / self.total)
+        percent = self.done * 100 // self.total
+        if self.label is not None and percent - self.logged_percent >= self.LOG_EVERY_PERCENT:
+            self.logged_percent = percent
+            emit_info(f"{self.label} {self.done}/{self.total} ({percent}%)")
 
 
 def parse_json(text: str | bytes) -> object:

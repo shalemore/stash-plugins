@@ -357,7 +357,11 @@ def _assign_images_to_clusters(
         if not gallery.organized and gallery.details:
             matcher.add(gallery.id, gallery.details)
 
-    progress = Progress(len(to_process)) if report_progress else None
+    progress = (
+        Progress(len(to_process), label="Gallery Cluster: clustering images")
+        if report_progress
+        else None
+    )
     joined = 0
     created = 0
     pending_adds: dict[str, list[str]] = {}
@@ -453,7 +457,11 @@ def _sync_all_managed_galleries(
             if gid in images_by_gallery:
                 images_by_gallery[gid].append(img)
 
-    progress = Progress(len(non_empty)) if report_progress else None
+    progress = (
+        Progress(len(non_empty), label="Gallery Cluster: syncing galleries")
+        if report_progress
+        else None
+    )
     updated = 0
     removed = 0
     for gallery in non_empty:
@@ -595,6 +603,8 @@ def run_cluster(
     managed = find_managed_galleries(client, tag_id)
     remaining_managed = [g for g in managed if g.image_count > 0 or g.organized]
 
+    emit_info(f"Gallery Cluster: clustering {len(candidates)} tagged images...")
+
     assign_stats = _assign_images_to_clusters(
         client,
         candidates,
@@ -607,8 +617,9 @@ def run_cluster(
     # Sync every managed gallery once: delete the empty ones, drop members that lost the
     # source tag, and refresh the metadata that drifted.
     refreshed = find_managed_galleries(client, tag_id)
+    emit_info(f"Gallery Cluster: syncing {len(refreshed)} managed galleries...")
     synced_updated, removed, destroyed = _sync_all_managed_galleries(
-        client, refreshed, cluster_settings, dry_run=dry_run
+        client, refreshed, cluster_settings, dry_run=dry_run, report_progress=True
     )
 
     emit_progress(1.0)
