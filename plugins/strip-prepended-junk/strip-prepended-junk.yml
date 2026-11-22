@@ -1,0 +1,22 @@
+name: Strip Prepended Junk
+description: Remove the image or stray bytes a downloader put in front of a scene's video stream
+version: 0.1.0
+
+url: https://github.com/shalemore/stash-plugins
+
+exec:
+  - python3
+  - "{pluginDir}/main.py"
+
+interface: raw
+errLog: info
+
+tasks:
+  - name: Strip prepended junk
+    description: Check every scene for a video stream hidden behind a prefix, cut it, and rescan the file in place
+    defaultArgs:
+      dry_run: false
+  - name: Dry Run
+    description: List the scenes whose stream starts after a prefix, without touching them
+    defaultArgs:
+      dry_run: true
