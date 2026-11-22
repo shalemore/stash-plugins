@@ -12,12 +12,14 @@ Configure these in **Stash → Settings → Plugins → Gallery Cluster**:
 
 ## Behavior
 
-- **Grouping (`Image.Create.Post`, `Image.Update.Post`)**: Tagged images with a non-empty `details` description that are not `organized` and not yet in a managed gallery are matched against existing unorganized managed galleries. If none meets the threshold, a new gallery is created for the image.
-- **Matching**: Only gallery `details` are compared, never image-to-image, so an image joins the first gallery whose description is similar enough. The gallery `details` always come from the first image that created it.
-- **Timeline metadata**: Each unorganized managed gallery derives:
-  - `title` from the earliest image's `title`
-  - `date` from the latest image's `date`
-  - `cover` from the earliest image
+- **Grouping (`Image.Create.Post`, `Image.Update.Post`)**: Tagged images with a non-empty `details` description that are not `organized` and not yet in a managed gallery are matched against existing unorganized managed galleries. If none meets the threshold, a new gallery is created for the image. Editing an image that already sits in a managed gallery re-derives that gallery's metadata.
+- **Matching**: Only gallery `details` are compared, never image-to-image, so an image joins the first gallery whose description is similar enough. The gallery `details` follow the latest image that has a description.
+- **Derived metadata**: Each unorganized managed gallery derives:
+  - `title`, `details`, and `cover` from the latest image, so the gallery presents its newest variant
+  - `date` from the earliest image
+  - `performers` from the union of every image's performers
+  - `studio` from the images, only when all of them share one studio; a gallery loses its studio when they disagree
+  - `rating` from the average of the ratings that exist, rounded to the step the UI can show (20 for whole stars, 10 for half stars, 5 for quarter stars, 10 for a 10-point scale, 1 for percent)
 - **Manual lock (`organized`)**: Images or galleries marked `organized` are left untouched by automatic clustering and metadata syncing.
 - **Cleanup (`Image.Destroy.Post`, `Gallery.Update.Post`)**: Updates remaining gallery metadata when images are removed, and deletes unorganized managed galleries that reach `0` images.
 
@@ -28,4 +30,4 @@ Configure these in **Stash → Settings → Plugins → Gallery Cluster**:
 
 ## Changing settings later
 
-Managed galleries are found by the **Gallery tag**, so renaming the source tag only changes which images are picked up. Pointing the plugin at a different gallery tag leaves the galleries carrying the old tag untouched: they keep their images, title, date, and cover, and stop being managed.
+Managed galleries are found by the **Gallery tag**, so renaming the source tag only changes which images are picked up. Pointing the plugin at a different gallery tag leaves the galleries carrying the old tag untouched: they keep their images and derived metadata, and stop being managed.

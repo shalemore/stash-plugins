@@ -41,9 +41,12 @@ def make_image(
     details: str = "A portrait under warm sunlight",
     organized: bool = False,
     created_at: str = "2026-01-01T00:00:00Z",
+    rating100: int | None = None,
+    studio_id: str | None = None,
     paths: tuple[str, ...] = ("/data/img/a.avif",),
     gallery_ids: tuple[str, ...] = (),
     tag_ids: tuple[str, ...] = ("99",),
+    performer_ids: tuple[str, ...] = (),
 ) -> object:
     return stash_api.ImageItem(
         id=image_id,
@@ -53,10 +56,23 @@ def make_image(
         details=details,
         organized=organized,
         created_at=created_at,
+        rating100=rating100,
+        studio_id=studio_id,
         paths=paths,
         gallery_ids=gallery_ids,
         tag_ids=tag_ids,
+        performer_ids=performer_ids,
     )
+
+
+def make_settings(**overrides: object) -> object:
+    values: dict[str, object] = {
+        "gallery_tag_id": "99",
+        "similarity_threshold": cluster.DEFAULT_SIMILARITY_THRESHOLD,
+        "rating_step": 20,
+    }
+    values.update(overrides)
+    return cluster.ClusterSettings(**values)
 
 
 def test_normalize_description_strips_punctuation_whitespace_and_case():
@@ -82,23 +98,51 @@ def test_description_matcher_exact_and_fuzzy():
 
 
 def test_parse_config_reads_tags_and_defaults_threshold():
-    cfg = cluster.parse_config({"source_tag": " Grouped ", "gallery_tag": "Batches"})
+    cfg = cluster.parse_config({"source_tag": " Grouped ", "gallery_tag": "Batches"}, {})
     assert cfg.source_tag == "Grouped"
     assert cfg.gallery_tag == "Batches"
     assert cfg.similarity_threshold == cluster.DEFAULT_SIMILARITY_THRESHOLD
+    assert cfg.rating_step == 20
 
-    assert cluster.parse_config({"similarity_threshold": "0.9"}).similarity_threshold == 0.9
-    assert cluster.parse_config({"similarity_threshold": "1"}).similarity_threshold == 1.0
+    def threshold(settings: dict[str, object]) -> float:
+        return cluster.parse_config(settings, {}).similarity_threshold
+
+    assert threshold({"similarity_threshold": "0.9"}) == 0.9
+    assert threshold({"similarity_threshold": "1"}) == 1.0
 
     # Stash renders an unset setting as 0, so 0 must fall back to the default.
-    assert cluster.parse_config({"similarity_threshold": 0}).similarity_threshold == (
-        cluster.DEFAULT_SIMILARITY_THRESHOLD
-    )
+    assert threshold({"similarity_threshold": 0}) == cluster.DEFAULT_SIMILARITY_THRESHOLD
 
     with pytest.raises(ValueError, match="similarity_threshold"):
-        cluster.parse_config({"similarity_threshold": "1.5"})
+        threshold({"similarity_threshold": "1.5"})
     with pytest.raises(ValueError, match="similarity_threshold"):
-        cluster.parse_config({"similarity_threshold": "abc"})
+        threshold({"similarity_threshold": "abc"})
+
+
+def test_parse_rating_step_follows_the_ui_rating_system():
+    def step(options: object) -> int:
+        return cluster.parse_rating_step({"ratingSystemOptions": options})
+
+    assert step(None) == 20
+    assert step({"type": "stars", "starPrecision": "full"}) == 20
+    assert step({"type": "stars", "starPrecision": "half"}) == 10
+    assert step({"type": "stars", "starPrecision": "quarter"}) == 5
+    assert step({"type": "decimal"}) == 10
+    assert step({"type": "percent"}) == 1
+    assert step({"type": "unknown"}) == 20
+
+
+def test_average_rating100_snaps_to_the_rating_step():
+    rated = [make_image("1", rating100=60), make_image("2", rating100=40)]
+    assert cluster.average_rating100(rated, 20) == 60
+    assert cluster.average_rating100([make_image("1", rating100=90)], 20) == 100
+    assert cluster.average_rating100([make_image("1", rating100=25)], 10) == 30
+    assert cluster.average_rating100([make_image("1", rating100=55)], 1) == 55
+    assert cluster.average_rating100([make_image("1"), make_image("2")], 20) == 0
+
+    # Unrated images are ignored instead of counting as zero.
+    unrated = [make_image("1", rating100=80), make_image("2")]
+    assert cluster.average_rating100(unrated, 20) == 80
 
 
 def test_select_candidates_requires_source_tag_description_and_ungrouped():
@@ -111,25 +155,50 @@ def test_select_candidates_requires_source_tag_description_and_ungrouped():
     assert [img.id for img in selected] == ["1"]
 
 
-def test_derive_gallery_metadata_uses_earliest_title_and_latest_date():
+def test_derive_gallery_metadata_uses_latest_title_and_earliest_date():
     early = make_image(
         "10",
         title="2025-09-13 17:34",
         code="1757756051000",
         date="2025-09-13",
+        details="Early prompt variant",
+        rating100=20,
+        studio_id="5",
+        performer_ids=("7",),
     )
     late = make_image(
         "20",
         title="2026-02-04 15:16",
         code="1770189360000",
         date="2026-02-04",
+        details="Latest prompt variant",
+        rating100=40,
+        studio_id="5",
+        performer_ids=("7", "8"),
     )
     assert cluster.image_sort_key(early) < cluster.image_sort_key(late)
 
-    title, date, cover = cluster.derive_gallery_metadata([late, early])
-    assert title == "2025-09-13 17:34"
-    assert date == "2026-02-04"
-    assert cover == "10"
+    metadata = cluster.derive_gallery_metadata([late, early], rating_step=20)
+    assert metadata.title == "2026-02-04 15:16"
+    assert metadata.date == "2025-09-13"
+    assert metadata.details == "Latest prompt variant"
+    assert metadata.cover_image_id == "20"
+    assert metadata.performer_ids == ("7", "8")
+    assert metadata.studio_id == "5"
+    assert metadata.rating100 == 40
+
+
+def test_common_studio_id_requires_every_image_to_agree():
+    assert cluster.common_studio_id([make_image("1", studio_id="5")]) == "5"
+    assert (
+        cluster.common_studio_id([make_image("1", studio_id="5"), make_image("2", studio_id="5")])
+        == "5"
+    )
+    assert (
+        cluster.common_studio_id([make_image("1", studio_id="5"), make_image("2", studio_id="6")])
+        is None
+    )
+    assert cluster.common_studio_id([make_image("1"), make_image("2")]) is None
 
 
 def test_assign_images_dry_run_creates_single_and_merges_similar():
@@ -167,8 +236,7 @@ def test_assign_images_dry_run_creates_single_and_merges_similar():
         client=None,
         candidates=cluster.select_candidates([img1, img2, img3, locked], "99"),
         managed_galleries=[],
-        tag_id="99",
-        threshold=0.85,
+        settings=make_settings(),
         dry_run=True,
     )
     assert stats == {"evaluated": 3, "joined": 1, "created": 2, "updated": 1}
@@ -182,8 +250,11 @@ def test_cleanup_empty_galleries_respects_organized():
         details="image description",
         organized=False,
         image_count=0,
+        rating100=None,
+        studio_id=None,
         cover_id=None,
         tag_ids=("99",),
+        performer_ids=(),
     )
     g_locked = stash_api.GalleryItem(
         id="2",
@@ -192,7 +263,10 @@ def test_cleanup_empty_galleries_respects_organized():
         details="image description",
         organized=True,
         image_count=0,
+        rating100=None,
+        studio_id=None,
         cover_id=None,
         tag_ids=("99",),
+        performer_ids=(),
     )
     assert cluster._cleanup_empty_galleries(None, [g_empty, g_locked], dry_run=True) == 1

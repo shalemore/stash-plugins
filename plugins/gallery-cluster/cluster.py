@@ -17,7 +17,7 @@ from stash_api import (
     find_images_by_tag,
     find_images_in_galleries,
     find_managed_galleries,
-    get_plugin_settings,
+    get_configuration,
     resolve_tag_id,
     set_gallery_cover,
     update_gallery,
@@ -26,6 +26,7 @@ from stash_plugin import (
     PluginInput,
     Progress,
     StashClient,
+    as_object,
     as_str,
     emit_info,
     emit_progress,
@@ -33,6 +34,9 @@ from stash_plugin import (
 )
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_RATING_STEP = 20
+RATING_SYSTEM_STEPS = {"stars": 20, "decimal": 10, "percent": 1}
+STAR_PRECISION_STEPS = {"full": 20, "half": 10, "quarter": 5}
 EPOCH_RE = re.compile(r"^\d{10,13}$")
 TITLE_DATETIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)")
 DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
@@ -43,6 +47,16 @@ class ClusterConfig:
     source_tag: str
     gallery_tag: str
     similarity_threshold: float
+    rating_step: int
+
+
+@dataclass(frozen=True)
+class ClusterSettings:
+    """Resolved values a sync pass needs: gallery tag ID, matching threshold, rating step."""
+
+    gallery_tag_id: str
+    similarity_threshold: float
+    rating_step: int
 
 
 def parse_threshold(value: object) -> float:
@@ -64,11 +78,22 @@ def parse_threshold(value: object) -> float:
     return parsed
 
 
-def parse_config(settings: dict[str, object]) -> ClusterConfig:
+def parse_rating_step(ui: dict[str, object]) -> int:
+    """Smallest `rating100` increment the UI can display, from the configured rating system."""
+    options = as_object(ui.get("ratingSystemOptions")) or {}
+    system = as_str(options.get("type")) or "stars"
+    if system != "stars":
+        return RATING_SYSTEM_STEPS.get(system, DEFAULT_RATING_STEP)
+    precision = as_str(options.get("starPrecision")) or "full"
+    return STAR_PRECISION_STEPS.get(precision, DEFAULT_RATING_STEP)
+
+
+def parse_config(settings: dict[str, object], ui: dict[str, object]) -> ClusterConfig:
     return ClusterConfig(
         source_tag=(as_str(settings.get("source_tag")) or "").strip(),
         gallery_tag=(as_str(settings.get("gallery_tag")) or "").strip(),
         similarity_threshold=parse_threshold(settings.get("similarity_threshold")),
+        rating_step=parse_rating_step(ui),
     )
 
 
@@ -124,17 +149,60 @@ def _extract_title(image: ImageItem) -> str:
     return image.id
 
 
-def derive_gallery_metadata(images: list[ImageItem]) -> tuple[str, str, str]:
-    """Return `(title, date, cover_image_id)` from a non-empty list of images.
+@dataclass(frozen=True)
+class GalleryMetadata:
+    title: str
+    date: str
+    details: str
+    cover_image_id: str
+    performer_ids: tuple[str, ...]
+    studio_id: str | None
+    rating100: int
 
-    - `title` follows the earliest image's title (creation timestamp).
-    - `date` follows the latest image's date (most recent activity).
-    - `cover_image_id` is the earliest image's ID.
+
+def average_rating100(images: list[ImageItem], step: int) -> int:
+    """Average the ratings that exist, then snap to a step the UI can display.
+
+    Unrated images are left out instead of counting as zero, so one rated image in a
+    gallery is not diluted by the ones nobody rated.
+    """
+    ratings = [image.rating100 for image in images if image.rating100]
+    if not ratings:
+        return 0
+    mean = sum(ratings) / len(ratings)
+    return min(int((mean + step / 2) // step) * step, 100)
+
+
+def common_studio_id(images: list[ImageItem]) -> str | None:
+    """The studio shared by every image, or None when they disagree."""
+    studios = {image.studio_id for image in images}
+    if len(studios) != 1:
+        return None
+    return studios.pop()
+
+
+def derive_gallery_metadata(images: list[ImageItem], rating_step: int) -> GalleryMetadata:
+    """Derive the gallery fields from a non-empty list of images.
+
+    Everything but `date` follows the latest image, so a gallery presents its newest
+    variant: `title`, `details`, and `cover`. `date` follows the earliest image so the
+    gallery sorts by when the batch started. `performer_ids` is the union over every
+    image, `studio_id` survives only when all images share it, and `rating100` is the
+    average of the ratings that exist.
     """
     ordered = sorted(images, key=image_sort_key)
     earliest = ordered[0]
-    latest = ordered[-1]
-    return _extract_title(earliest), _extract_date(latest), earliest.id
+    latest = next((image for image in reversed(ordered) if image.details), ordered[-1])
+    performers = sorted({performer_id for image in images for performer_id in image.performer_ids})
+    return GalleryMetadata(
+        title=_extract_title(latest),
+        date=_extract_date(earliest),
+        details=latest.details,
+        cover_image_id=latest.id,
+        performer_ids=tuple(performers),
+        studio_id=common_studio_id(images),
+        rating100=average_rating100(images, rating_step),
+    )
 
 
 @dataclass
@@ -147,48 +215,76 @@ class _ClusterBucket:
 def _sync_gallery_fields(
     client: StashClient,
     bucket: _ClusterBucket,
+    settings: ClusterSettings,
     *,
     dry_run: bool,
 ) -> bool:
-    """Update gallery title, date, details, and cover if out of sync. Returns whether changed."""
+    """Update derived gallery fields if out of sync. Returns whether anything changed."""
     if bucket.gallery.organized or not bucket.images:
         return False
 
-    desired_title, desired_date, desired_cover = derive_gallery_metadata(bucket.images)
-    desired_details: str | None = None
-    if not bucket.gallery.details:
-        for img in sorted(bucket.images, key=image_sort_key):
-            if img.details:
-                desired_details = img.details
-                break
+    metadata = derive_gallery_metadata(bucket.images, settings.rating_step)
 
-    update_title = desired_title if bucket.gallery.title != desired_title else None
-    update_date = desired_date if desired_date and bucket.gallery.date != desired_date else None
-    need_cover = bucket.gallery.cover_id != desired_cover
+    update_title = metadata.title if bucket.gallery.title != metadata.title else None
+    update_date = metadata.date if metadata.date and bucket.gallery.date != metadata.date else None
+    update_details = (
+        metadata.details
+        if metadata.details and bucket.gallery.details != metadata.details
+        else None
+    )
+    need_cover = bucket.gallery.cover_id != metadata.cover_image_id
+    need_performers = set(bucket.gallery.performer_ids) != set(metadata.performer_ids)
+    need_studio = bucket.gallery.studio_id != metadata.studio_id
+    need_rating = (bucket.gallery.rating100 or 0) != metadata.rating100
 
-    if update_title is None and update_date is None and desired_details is None and not need_cover:
+    if (
+        update_title is None
+        and update_date is None
+        and update_details is None
+        and not need_cover
+        and not need_performers
+        and not need_studio
+        and not need_rating
+    ):
         return False
 
     if not dry_run:
-        if update_title is not None or update_date is not None or desired_details is not None:
+        if (
+            update_title is not None
+            or update_date is not None
+            or update_details is not None
+            or need_performers
+            or need_studio
+            or need_rating
+        ):
             update_gallery(
                 client,
                 gallery_id=bucket.gallery.id,
                 title=update_title,
                 date=update_date,
-                details=desired_details,
+                details=update_details,
+                performer_ids=metadata.performer_ids if need_performers else None,
+                studio_id=metadata.studio_id if need_studio else None,
+                clear_studio=need_studio and metadata.studio_id is None,
+                rating100=metadata.rating100 if need_rating else None,
             )
         if need_cover:
-            set_gallery_cover(client, bucket.gallery.id, desired_cover)
+            set_gallery_cover(client, bucket.gallery.id, metadata.cover_image_id)
 
     if update_title is not None:
         bucket.gallery.title = update_title
     if update_date is not None:
         bucket.gallery.date = update_date
-    if desired_details is not None:
-        bucket.gallery.details = desired_details
+    if update_details is not None:
+        bucket.gallery.details = update_details
     if need_cover:
-        bucket.gallery.cover_id = desired_cover
+        bucket.gallery.cover_id = metadata.cover_image_id
+    if need_performers:
+        bucket.gallery.performer_ids = metadata.performer_ids
+    if need_studio:
+        bucket.gallery.studio_id = metadata.studio_id
+    if need_rating:
+        bucket.gallery.rating100 = metadata.rating100
     return True
 
 
@@ -208,8 +304,7 @@ def _assign_images_to_clusters(
     client: StashClient,
     candidates: list[ImageItem],
     managed_galleries: list[GalleryItem],
-    tag_id: str,
-    threshold: float,
+    settings: ClusterSettings,
     *,
     dry_run: bool,
     report_progress: bool = False,
@@ -217,7 +312,7 @@ def _assign_images_to_clusters(
     """Match ungrouped candidate images to existing galleries or create new ones."""
     managed_ids = {g.id for g in managed_galleries}
     buckets: dict[str, _ClusterBucket] = {}
-    matcher = DescriptionMatcher(threshold)
+    matcher = DescriptionMatcher(settings.similarity_threshold)
 
     active_gallery_ids = [g.id for g in managed_galleries if g.image_count > 0]
     images_by_gallery: dict[str, list[ImageItem]] = {gid: [] for gid in active_gallery_ids}
@@ -258,31 +353,36 @@ def _assign_images_to_clusters(
             touched_buckets.add(target_id)
             joined += 1
         else:
-            title = _extract_title(img)
-            date = _extract_date(img)
+            metadata = derive_gallery_metadata([img], settings.rating_step)
             if dry_run:
                 synthetic_counter += 1
                 new_id = f"dry-run-{synthetic_counter}"
             else:
                 new_id = create_gallery(
                     client,
-                    title=title,
-                    date=date,
-                    details=img.details,
-                    tag_id=tag_id,
+                    title=metadata.title,
+                    date=metadata.date,
+                    details=metadata.details,
+                    tag_id=settings.gallery_tag_id,
+                    performer_ids=metadata.performer_ids,
+                    studio_id=metadata.studio_id,
+                    rating100=metadata.rating100,
                 )
                 add_gallery_images(client, new_id, [img.id])
-                set_gallery_cover(client, new_id, img.id)
+                set_gallery_cover(client, new_id, metadata.cover_image_id)
 
             new_gallery = GalleryItem(
                 id=new_id,
-                title=title,
-                date=date,
-                details=img.details,
+                title=metadata.title,
+                date=metadata.date,
+                details=metadata.details,
                 organized=False,
                 image_count=1,
-                cover_id=img.id,
-                tag_ids=(tag_id,),
+                rating100=metadata.rating100,
+                studio_id=metadata.studio_id,
+                cover_id=metadata.cover_image_id,
+                tag_ids=(settings.gallery_tag_id,),
+                performer_ids=metadata.performer_ids,
             )
             buckets[new_id] = _ClusterBucket(gallery=new_gallery, images=[img], is_new=True)
             matcher.add(new_id, img.details)
@@ -297,7 +397,7 @@ def _assign_images_to_clusters(
 
     updated = 0
     for gallery_id in touched_buckets:
-        if _sync_gallery_fields(client, buckets[gallery_id], dry_run=dry_run):
+        if _sync_gallery_fields(client, buckets[gallery_id], settings, dry_run=dry_run):
             updated += 1
 
     return {
@@ -311,6 +411,7 @@ def _assign_images_to_clusters(
 def _sync_all_managed_galleries(
     client: StashClient,
     managed_galleries: list[GalleryItem],
+    settings: ClusterSettings,
     *,
     dry_run: bool,
     report_progress: bool = False,
@@ -336,7 +437,7 @@ def _sync_all_managed_galleries(
             destroyed += 1
         else:
             bucket = _ClusterBucket(gallery=gallery, images=imgs)
-            if _sync_gallery_fields(client, bucket, dry_run=dry_run):
+            if _sync_gallery_fields(client, bucket, settings, dry_run=dry_run):
                 updated += 1
         if progress:
             progress.step()
@@ -351,8 +452,8 @@ def run_cluster(
     item_ids: list[str] | None,
 ) -> object:
     client = StashClient.connect(plugin_input)
-    settings = get_plugin_settings(client)
-    config = parse_config(settings)
+    configuration = get_configuration(client)
+    config = parse_config(configuration.settings, configuration.ui)
 
     if not config.source_tag or not config.gallery_tag:
         message = "Skipped: configure both 'Source tag' and 'Gallery tag' in Plugin Settings first."
@@ -380,32 +481,51 @@ def run_cluster(
             emit_info(message)
         return {"dry_run": dry_run, "missing_tag": config.gallery_tag}
 
+    cluster_settings = ClusterSettings(
+        gallery_tag_id=tag_id,
+        similarity_threshold=config.similarity_threshold,
+        rating_step=config.rating_step,
+    )
+
     if entity_type == "image" and item_ids is not None:
-        images = select_candidates(find_images_by_ids(client, item_ids), source_tag_id)
-        if not images:
+        images = find_images_by_ids(client, item_ids)
+        candidates = select_candidates(images, source_tag_id)
+        if not candidates:
             return {"dry_run": dry_run, "evaluated": 0, "joined": 0, "created": 0, "updated": 0}
 
         managed = find_managed_galleries(client, tag_id)
         stats = _assign_images_to_clusters(
             client,
-            images,
+            candidates,
             managed,
-            tag_id,
-            config.similarity_threshold,
+            cluster_settings,
             dry_run=dry_run,
         )
+
+        # An image that already belongs to a managed gallery changes that gallery's derived
+        # fields, so resync the galleries it is in even when it is not a clustering candidate.
+        affected = [g for g in managed if any(g.id in img.gallery_ids for img in images)]
+        resynced = 0
+        if affected:
+            resynced, _ = _sync_all_managed_galleries(
+                client, affected, cluster_settings, dry_run=dry_run
+            )
+
         emit_info(
             f"Gallery Cluster: evaluated {stats['evaluated']} images, "
             f"joined {stats['joined']} into existing galleries, "
-            f"created {stats['created']} new galleries, updated {stats['updated']} galleries."
+            f"created {stats['created']} new galleries, "
+            f"updated {stats['updated'] + resynced} galleries."
         )
-        return {"dry_run": dry_run, **stats}
+        return {"dry_run": dry_run, **stats, "updated": stats["updated"] + resynced}
 
     if entity_type == "gallery" and item_ids is not None:
         galleries = [g for g in find_galleries_by_ids(client, item_ids) if tag_id in g.tag_ids]
         if not galleries:
             return {"dry_run": dry_run, "updated": 0, "destroyed": 0}
-        updated, destroyed = _sync_all_managed_galleries(client, galleries, dry_run=dry_run)
+        updated, destroyed = _sync_all_managed_galleries(
+            client, galleries, cluster_settings, dry_run=dry_run
+        )
         emit_info(
             f"Gallery Cluster: updated {updated} galleries, destroyed {destroyed} empty galleries."
         )
@@ -413,7 +533,9 @@ def run_cluster(
 
     if entity_type == "image_destroy":
         managed = find_managed_galleries(client, tag_id)
-        updated, destroyed = _sync_all_managed_galleries(client, managed, dry_run=dry_run)
+        updated, destroyed = _sync_all_managed_galleries(
+            client, managed, cluster_settings, dry_run=dry_run
+        )
         emit_info(
             f"Gallery Cluster: updated {updated} galleries, destroyed {destroyed} empty galleries."
         )
@@ -432,8 +554,7 @@ def run_cluster(
         client,
         candidates,
         remaining_managed,
-        tag_id,
-        config.similarity_threshold,
+        cluster_settings,
         dry_run=dry_run,
         report_progress=True,
     )
@@ -442,7 +563,7 @@ def run_cluster(
     if not dry_run:
         refreshed = find_managed_galleries(client, tag_id)
         synced_updated, extra_destroyed = _sync_all_managed_galleries(
-            client, refreshed, dry_run=False
+            client, refreshed, cluster_settings, dry_run=False
         )
     else:
         synced_updated, extra_destroyed = 0, 0
