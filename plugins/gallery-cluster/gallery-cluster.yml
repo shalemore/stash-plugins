@@ -22,12 +22,12 @@ settings:
     type: STRING
   similarity_threshold:
     displayName: Similarity threshold
-    description: Minimum description similarity (0 to 1) to join an existing gallery. Empty or 0 uses 0.85.
+    description: Minimum description similarity (0 to 1) to join an existing gallery. Empty or 0 uses 0.80. Prompts that only add or drop a clause also match, when one contains at least 90% of the other's text and similarity is at least 0.65.
     type: STRING
 
 tasks:
   - name: Full Rebuild
-    description: Group tagged ungrouped images and sync managed gallery titles, dates, covers, and empty galleries
+    description: Regroup every tagged image from scratch with the current rules, reusing managed galleries that still fit and deleting the ones that do not. Images in organized galleries are left alone, and manual edits to managed galleries are lost.
     defaultArgs:
       dry_run: false
   - name: Dry Run

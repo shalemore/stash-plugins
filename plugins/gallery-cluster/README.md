@@ -8,12 +8,12 @@ Configure these in **Stash → Settings → Plugins → Gallery Cluster**:
 
 - **Source tag**: Tag name or ID. Only ungrouped images carrying this tag are grouped, so the plugin never touches the rest of the library. Leave empty to skip all images.
 - **Gallery tag**: Tag name or ID applied to managed galleries. The plugin creates it if a name is given and does not exist yet.
-- **Similarity threshold**: Minimum normalized character 3-gram Jaccard similarity (`0` to `1`, default `0.85`) required for an image to join an existing managed gallery. Set to `1` for exact normalized matches only. Stash has no default value for plugin settings, so an empty field or `0` means `0.85`.
+- **Similarity threshold**: Minimum normalized character 3-gram Jaccard similarity (`0` to `1`, default `0.80`) required for an image to join an existing managed gallery. Set to `1` for exact normalized matches only. Stash has no default value for plugin settings, so an empty field or `0` means `0.80`.
 
 ## Behavior
 
 - **Grouping (`Image.Create.Post`, `Image.Update.Post`)**: Tagged images with a non-empty `details` description that are not `organized` and not yet in a managed gallery are matched against existing unorganized managed galleries. If none meets the threshold, a new gallery is created for the image. Editing an image that already sits in a managed gallery re-derives that gallery's metadata.
-- **Matching**: Only gallery `details` are compared, never image-to-image, so an image joins the first gallery whose description is similar enough. The gallery `details` follow the latest image that has a description.
+- **Matching**: Only gallery `details` are compared, never image-to-image, so an image joins the first gallery whose description is similar enough. Prompts that only add or drop a clause still match: besides the threshold, a prompt also qualifies when it contains at least 90% of the other one's n-grams and the similarity is at least `0.65`, so rewriting one sentence of a prompt does not split a batch. The gallery `details` follow the latest image that has a description.
 - **Derived metadata**: Each unorganized managed gallery derives:
   - `title`, `details`, and `cover` from the latest image, so the gallery presents its newest variant
   - `date` from the earliest image
@@ -25,8 +25,8 @@ Configure these in **Stash → Settings → Plugins → Gallery Cluster**:
 
 ## Tasks
 
-- **Dry Run**: Preview how many tagged images would be grouped or synced without modifying Stash.
-- **Full Rebuild**: Process all tagged ungrouped images and synchronize managed galleries.
+- **Dry Run**: Preview how many tagged images would be grouped and how the galleries would change, without modifying Stash.
+- **Full Rebuild**: Regroup every tagged image from scratch with the current rules. A group takes over the managed gallery that already holds most of its images, so gallery IDs survive; groups without one get a new gallery, and galleries no group wants are deleted. Images inside organized galleries are left alone, but manual edits to managed gallery titles, dates, and descriptions are lost.
 
 ## Changing settings later
 

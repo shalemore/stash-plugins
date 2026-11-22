@@ -6,6 +6,8 @@ import unicodedata
 from dataclasses import dataclass
 
 DEFAULT_NGRAM_SIZE = 3
+CONTAINMENT_MIN = 0.90
+CONTAINMENT_MIN_JACCARD = 0.65
 
 
 def normalize_description(text: str) -> str:
@@ -34,7 +36,6 @@ def jaccard_similarity(a: frozenset[str], b: frozenset[str]) -> float:
         return 1.0
     if not a or not b:
         return 0.0
-    # Quick upper-bound check: |A & B| / |A | B| <= min(|A|, |B|) / max(|A|, |B|)
     inter = len(a & b)
     return inter / (len(a) + len(b) - inter)
 
@@ -49,7 +50,13 @@ class IndexedCandidate:
 
 
 class DescriptionMatcher:
-    """Matches incoming descriptions against indexed candidates above a Jaccard threshold."""
+    """Matches incoming descriptions against indexed candidates above a similarity threshold.
+
+    Two prompts match when their character n-grams overlap enough. A prompt that only adds or
+    drops a clause can fall short of the Jaccard threshold while still containing almost all of
+    the other one's n-grams, so containment is accepted as well, guarded by a Jaccard floor so
+    a short prompt cannot be swallowed by a long one.
+    """
 
     def __init__(self, threshold: float, ngram_size: int = DEFAULT_NGRAM_SIZE) -> None:
         self.threshold: float = threshold
@@ -71,7 +78,7 @@ class DescriptionMatcher:
         _ = self._exact.setdefault(normalized, candidate)
 
     def find_best(self, description: str) -> tuple[str, float] | None:
-        """Return `(candidate_key, score)` for the best match >= threshold, or None."""
+        """Return `(candidate_key, score)` for the best match, or None."""
         normalized = normalize_description(description)
         if not normalized:
             return None
@@ -79,29 +86,36 @@ class DescriptionMatcher:
         if exact := self._exact.get(normalized):
             return exact.key, 1.0
 
-        if self.threshold >= 1.0:
-            return None
-
         query_grams = char_ngrams(normalized, self.ngram_size)
         query_len = len(query_grams)
         if query_len == 0:
             return None
 
+        floor = min(self.threshold, CONTAINMENT_MIN_JACCARD)
         best_key: str | None = None
-        best_score = self.threshold
+        best_score = 0.0
 
         for candidate in self._candidates:
             cand_len = len(candidate.ngrams)
             if cand_len == 0:
                 continue
-            # Necessary condition for Jaccard(A, B) >= threshold.
+            # Any qualifying pair has Jaccard >= floor, so a big length difference rules it out.
             min_len = min(query_len, cand_len)
             max_len = max(query_len, cand_len)
-            if min_len < best_score * max_len:
+            if min_len < floor * max_len:
                 continue
 
-            score = jaccard_similarity(query_grams, candidate.ngrams)
-            if score >= best_score and (best_key is None or score > best_score):
+            inter = len(query_grams & candidate.ngrams)
+            if not inter:
+                continue
+            score = inter / (query_len + cand_len - inter)
+            if score < floor:
+                continue
+
+            containment = inter / min_len
+            if score < self.threshold and containment < CONTAINMENT_MIN:
+                continue
+            if score > best_score:
                 best_score = score
                 best_key = candidate.key
 

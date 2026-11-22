@@ -99,6 +99,30 @@ def test_description_matcher_exact_and_fuzzy():
     assert matcher.find_best("Completely unrelated landscape with mountains and snow.") is None
 
 
+PROMPT = (
+    "A quiet portrait of a man in a linen shirt, standing by a stone wall at dusk, "
+    "holding a camera, with soft rim light and shallow depth of field, shot on 35mm film."
+)
+
+
+def test_matcher_joins_a_prompt_that_dropped_a_clause():
+    trimmed = PROMPT.replace("standing by a stone wall at dusk, ", "")
+    matcher = similarity.DescriptionMatcher(threshold=0.85)
+    matcher.add("g1", PROMPT)
+
+    match = matcher.find_best(trimmed)
+    assert match is not None
+    assert match[0] == "g1"
+    assert 0.65 < match[1] < 0.85
+
+
+def test_matcher_does_not_let_a_long_prompt_swallow_a_short_one():
+    matcher = similarity.DescriptionMatcher(threshold=0.85)
+    matcher.add("g1", PROMPT)
+
+    assert matcher.find_best("A quiet portrait of a man") is None
+
+
 def test_parse_config_reads_tags_and_defaults_threshold():
     cfg = cluster.parse_config({"source_tag": " Grouped ", "gallery_tag": "Batches"}, {})
     assert cfg.source_tag == "Grouped"
@@ -253,6 +277,16 @@ def test_assign_images_dry_run_creates_single_and_merges_similar():
     assert stats == {"evaluated": 3, "joined": 1, "created": 2, "updated": 1}
 
 
+def test_cluster_groups_ignores_existing_gallery_membership():
+    already_grouped = make_image("1", details=PROMPT, gallery_ids=("g-old",))
+    elsewhere = make_image("2", details=PROMPT, gallery_ids=("g-other",))
+    unrelated = make_image("3", details="A snowy mountain peak at sunrise.")
+
+    groups = cluster._cluster_groups([already_grouped, elsewhere, unrelated], make_settings())
+
+    assert [sorted(img.id for img in group) for group in groups] == [["1", "2"], ["3"]]
+
+
 def test_cleanup_empty_galleries_respects_organized():
     g_empty = stash_api.GalleryItem(
         id="1",
@@ -332,9 +366,9 @@ def make_raw_member(
     }
 
 
-def make_gallery(image_count: int) -> object:
+def make_gallery(gallery_id: str = "g1", *, image_count: int = 1) -> object:
     return stash_api.GalleryItem(
-        id="g1",
+        id=gallery_id,
         title="2026-01-01 10:00",
         date="2026-01-01",
         details="image description",
@@ -368,7 +402,7 @@ def test_sync_removes_members_that_lost_the_source_tag():
     )
 
     updated, removed, destroyed = cluster._sync_all_managed_galleries(
-        client, [make_gallery(2)], make_settings(), dry_run=False
+        client, [make_gallery(image_count=2)], make_settings(), dry_run=False
     )
 
     assert removed == 1
@@ -384,9 +418,66 @@ def test_sync_destroys_a_gallery_whose_members_all_lost_the_source_tag():
     )
 
     updated, removed, destroyed = cluster._sync_all_managed_galleries(
-        client, [make_gallery(1)], make_settings(), dry_run=False
+        client, [make_gallery(image_count=1)], make_settings(), dry_run=False
     )
 
     assert (updated, removed, destroyed) == (0, 1, 1)
     assert len(client.called("removeGalleryImages")) == 1
     assert len(client.called("galleryDestroy")) == 1
+
+
+def test_apply_groups_keeps_the_gallery_that_already_holds_the_images():
+    client = FakeClient([make_raw_member("1", details="Prompt", tags=("99",), gallery_id="g1")])
+
+    stats = cluster._apply_groups(
+        client, [[make_image("1")]], [make_gallery()], make_settings(), dry_run=False
+    )
+
+    assert stats["reused"] == 1
+    assert stats["created"] == 0
+    assert client.called("addGalleryImages") == []
+    assert client.called("removeGalleryImages") == []
+    assert client.called("galleryDestroy") == []
+
+
+def test_apply_groups_moves_images_into_the_reused_gallery():
+    client = FakeClient([make_raw_member("1", details="Prompt", tags=("99",), gallery_id="g1")])
+
+    cluster._apply_groups(
+        client,
+        [[make_image("1"), make_image("2")]],
+        [make_gallery()],
+        make_settings(),
+        dry_run=False,
+    )
+
+    assert [call["input"] for call in client.called("addGalleryImages")] == [
+        {"gallery_id": "g1", "image_ids": ["2"]}
+    ]
+
+
+def test_apply_groups_deletes_galleries_no_group_wants():
+    client = FakeClient(
+        [
+            make_raw_member("1", details="Prompt", tags=("99",), gallery_id="g1"),
+            make_raw_member("2", details="Prompt", tags=("99",), gallery_id="g2"),
+        ]
+    )
+
+    stats = cluster._apply_groups(
+        client,
+        [[make_image("1")]],
+        [make_gallery(), make_gallery("g2")],
+        make_settings(),
+        dry_run=False,
+    )
+
+    assert stats["destroyed"] == 1
+    assert [call["input"] for call in client.called("galleryDestroy")] == [
+        {
+            "ids": ["g2"],
+            "delete_file": False,
+            "delete_generated": False,
+            "destroy_file_entry": False,
+        }
+    ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 from similarity import DescriptionMatcher
@@ -34,7 +35,7 @@ from stash_plugin import (
     emit_warn,
 )
 
-DEFAULT_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_SIMILARITY_THRESHOLD = 0.80
 DEFAULT_RATING_STEP = 20
 RATING_SYSTEM_STEPS = {"stars": 20, "decimal": 10, "percent": 1}
 STAR_PRECISION_STEPS = {"full": 20, "half": 10, "quarter": 5}
@@ -302,6 +303,121 @@ def _sync_gallery_fields(
     if need_rating:
         bucket.gallery.rating100 = metadata.rating100
     return True
+
+
+def _cluster_groups(
+    candidates: list[ImageItem],
+    settings: ClusterSettings,
+    *,
+    report_progress: bool = False,
+) -> list[list[ImageItem]]:
+    """Group every candidate from scratch, ignoring how the images are grouped today."""
+    matcher = DescriptionMatcher(settings.similarity_threshold)
+    ordered = sorted(candidates, key=image_sort_key)
+    groups: list[list[ImageItem]] = []
+    progress = (
+        Progress(len(ordered), label="Gallery Cluster: clustering images")
+        if report_progress
+        else None
+    )
+    for img in ordered:
+        match = matcher.find_best(img.details)
+        if match is None:
+            matcher.add(str(len(groups)), img.details)
+            groups.append([img])
+        else:
+            groups[int(match[0])].append(img)
+        if progress:
+            progress.step()
+    return groups
+
+
+def _apply_groups(
+    client: StashClient,
+    groups: list[list[ImageItem]],
+    managed_galleries: list[GalleryItem],
+    settings: ClusterSettings,
+    *,
+    dry_run: bool,
+    report_progress: bool = False,
+) -> dict[str, int]:
+    """Write the groups to Stash, reusing a managed gallery per group when one fits.
+
+    A group takes over the gallery that already holds most of its images, so regrouping does
+    not churn gallery IDs. Galleries no group wants are deleted, groups without one are
+    created.
+    """
+    editable = [gallery for gallery in managed_galleries if not gallery.organized]
+    members_by_gallery: dict[str, set[str]] = {gallery.id: set() for gallery in editable}
+    galleries_by_image: dict[str, set[str]] = {}
+    for img in find_images_in_galleries(client, [gallery.id for gallery in editable]):
+        for gallery_id in img.gallery_ids:
+            if gallery_id in members_by_gallery:
+                members_by_gallery[gallery_id].add(img.id)
+                galleries_by_image.setdefault(img.id, set()).add(gallery_id)
+
+    taken: set[str] = set()
+    targets: list[str | None] = []
+    for group in groups:
+        counts = Counter(
+            gallery_id for img in group for gallery_id in galleries_by_image.get(img.id, ())
+        )
+        target = next((gid for gid, _count in counts.most_common() if gid not in taken), None)
+        if target is not None:
+            taken.add(target)
+        targets.append(target)
+
+    gallery_by_id = {gallery.id: gallery for gallery in editable}
+    progress = (
+        Progress(len(groups), label="Gallery Cluster: writing galleries")
+        if report_progress
+        else None
+    )
+    created = updated = removed = 0
+    for group, target in zip(groups, targets, strict=True):
+        if target is None:
+            metadata = derive_gallery_metadata(group, settings.rating_step)
+            if not dry_run:
+                gallery_id = create_gallery(
+                    client,
+                    title=metadata.title,
+                    date=metadata.date,
+                    details=metadata.details,
+                    tag_id=settings.gallery_tag_id,
+                    performer_ids=metadata.performer_ids,
+                    studio_id=metadata.studio_id,
+                    rating100=metadata.rating100,
+                )
+                add_gallery_images(client, gallery_id, [img.id for img in group])
+            created += 1
+        else:
+            desired = {img.id for img in group}
+            current = members_by_gallery[target]
+            to_add = sorted(desired - current)
+            to_remove = sorted(current - desired)
+            if to_remove:
+                removed += len(to_remove)
+                if not dry_run:
+                    remove_gallery_images(client, target, to_remove)
+            if to_add and not dry_run:
+                add_gallery_images(client, target, to_add)
+            bucket = _ClusterBucket(gallery=gallery_by_id[target], images=group)
+            changed = _sync_gallery_fields(client, bucket, settings, dry_run=dry_run)
+            if to_add or to_remove or changed:
+                updated += 1
+        if progress:
+            progress.step()
+
+    obsolete = [gallery_id for gallery_id in members_by_gallery if gallery_id not in taken]
+    if obsolete and not dry_run:
+        destroy_galleries(client, obsolete)
+    return {
+        "created": created,
+        "reused": len(taken),
+        "updated": updated,
+        "removed": removed,
+        "destroyed": len(obsolete),
+    }
 
 
 def _cleanup_empty_galleries(
@@ -599,47 +715,39 @@ def run_cluster(
     # Full Rebuild / Dry Run task
     emit_info("Gallery Cluster: loading tagged images and managed galleries...")
     candidates = select_candidates(find_images_by_tag(client, source_tag_id), source_tag_id)
+    managed = find_managed_galleries(client, tag_id)
+
+    # Images inside an organized gallery are the manual lock: leave them and their gallery alone.
+    locked_ids = {gallery.id for gallery in managed if gallery.organized}
+    candidates = [img for img in candidates if not locked_ids.intersection(img.gallery_ids)]
     matched_images = len(candidates)
 
-    managed = find_managed_galleries(client, tag_id)
-    remaining_managed = [g for g in managed if g.image_count > 0 or g.organized]
+    emit_info(f"Gallery Cluster: clustering {matched_images} tagged images from scratch...")
+    groups = _cluster_groups(candidates, cluster_settings, report_progress=True)
 
-    emit_info(f"Gallery Cluster: clustering {len(candidates)} tagged images...")
-
-    assign_stats = _assign_images_to_clusters(
+    emit_info(f"Gallery Cluster: writing {len(groups)} galleries...")
+    apply_stats = _apply_groups(
         client,
-        candidates,
-        remaining_managed,
+        groups,
+        managed,
         cluster_settings,
         dry_run=dry_run,
         report_progress=True,
-    )
-
-    # Sync every managed gallery once: delete the empty ones, drop members that lost the
-    # source tag, and refresh the metadata that drifted.
-    refreshed = find_managed_galleries(client, tag_id)
-    emit_info(f"Gallery Cluster: syncing {len(refreshed)} managed galleries...")
-    synced_updated, removed, destroyed = _sync_all_managed_galleries(
-        client, refreshed, cluster_settings, dry_run=dry_run, report_progress=True
     )
 
     emit_progress(1.0)
     summary = {
         "dry_run": dry_run,
         "matched_images": matched_images,
-        "evaluated": assign_stats["evaluated"],
-        "joined": assign_stats["joined"],
-        "created": assign_stats["created"],
-        "updated": assign_stats["updated"] + synced_updated,
-        "removed": removed,
-        "destroyed": destroyed,
+        "groups": len(groups),
+        **apply_stats,
     }
     mode = "dry run" if dry_run else "rebuild"
     emit_info(
         f"Gallery Cluster {mode}: matched {summary['matched_images']} tagged images, "
-        f"evaluated {summary['evaluated']}, joined {summary['joined']} into existing galleries, "
-        f"created {summary['created']} new galleries, updated {summary['updated']} galleries, "
-        f"removed {summary['removed']} untagged images, "
-        f"destroyed {summary['destroyed']} empty galleries."
+        f"grouped them into {summary['groups']} galleries, "
+        f"created {summary['created']} new galleries, reused {summary['reused']}, "
+        f"updated {summary['updated']}, removed {summary['removed']} images from galleries, "
+        f"destroyed {summary['destroyed']} obsolete galleries."
     )
     return summary
