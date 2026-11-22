@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from similarity import DescriptionMatcher
 from stash_api import (
+    GalleryAnchor,
     GalleryItem,
     ImageItem,
     add_gallery_images,
     create_gallery,
     destroy_galleries,
     find_galleries_by_ids,
+    find_gallery_anchors,
     find_images_by_ids,
     find_images_by_tag,
     find_images_in_galleries,
@@ -422,7 +425,7 @@ def _apply_groups(
 
 def _cleanup_empty_galleries(
     client: StashClient,
-    galleries: list[GalleryItem],
+    galleries: Sequence[GalleryItem | GalleryAnchor],
     *,
     dry_run: bool,
 ) -> int:
@@ -435,14 +438,19 @@ def _cleanup_empty_galleries(
 def _assign_images_to_clusters(
     client: StashClient,
     candidates: list[ImageItem],
-    managed_galleries: list[GalleryItem],
+    anchors: list[GalleryAnchor],
     settings: ClusterSettings,
     *,
     dry_run: bool,
     report_progress: bool = False,
 ) -> dict[str, int]:
-    """Match ungrouped candidate images to existing galleries or create new ones."""
-    managed_ids = {g.id for g in managed_galleries}
+    """Match ungrouped candidate images to existing galleries or create new ones.
+
+    Only the anchors take part in matching. Members are loaded afterwards for the galleries
+    that actually gained an image, because a hook usually handles one image and pulling every
+    member of every managed gallery would dominate its runtime.
+    """
+    managed_ids = {anchor.id for anchor in anchors}
     to_process = sorted(
         (img for img in candidates if not any(gid in managed_ids for gid in img.gallery_ids)),
         key=image_sort_key,
@@ -450,28 +458,10 @@ def _assign_images_to_clusters(
     if not to_process:
         return {"evaluated": 0, "joined": 0, "created": 0, "updated": 0}
 
-    buckets: dict[str, _ClusterBucket] = {}
     matcher = DescriptionMatcher(settings.similarity_threshold)
-
-    active_gallery_ids = [g.id for g in managed_galleries if g.image_count > 0]
-    images_by_gallery: dict[str, list[ImageItem]] = {gid: [] for gid in active_gallery_ids}
-    if active_gallery_ids:
-        for img in find_images_in_galleries(client, active_gallery_ids):
-            # Members that lost the source tag are dropped by the sync pass, so leave them
-            # out of the metadata of galleries this pass rewrites.
-            if settings.source_tag_id not in img.tag_ids:
-                continue
-            for gid in img.gallery_ids:
-                if gid in images_by_gallery:
-                    images_by_gallery[gid].append(img)
-
-    for gallery in managed_galleries:
-        if gallery.image_count <= 0:
-            continue
-        bucket = _ClusterBucket(gallery=gallery, images=images_by_gallery.get(gallery.id, []))
-        buckets[gallery.id] = bucket
-        if not gallery.organized and gallery.details:
-            matcher.add(gallery.id, gallery.details)
+    for anchor in anchors:
+        if anchor.image_count > 0 and not anchor.organized and anchor.details:
+            matcher.add(anchor.id, anchor.details)
 
     progress = (
         Progress(len(to_process), label="Gallery Cluster: clustering images")
@@ -481,18 +471,15 @@ def _assign_images_to_clusters(
     joined = 0
     created = 0
     pending_adds: dict[str, list[str]] = {}
-    touched_buckets: set[str] = set()
+    touched: set[str] = set()
     synthetic_counter = 0
 
     for img in to_process:
         match = matcher.find_best(img.details)
         if match is not None:
             target_id, _score = match
-            bucket = buckets[target_id]
-            bucket.images.append(img)
-            bucket.gallery.image_count += 1
             pending_adds.setdefault(target_id, []).append(img.id)
-            touched_buckets.add(target_id)
+            touched.add(target_id)
             joined += 1
         else:
             metadata = derive_gallery_metadata([img], settings.rating_step)
@@ -513,21 +500,6 @@ def _assign_images_to_clusters(
                 # Stash sets the cover of a gallery without one to the first added image, so
                 # nothing else is needed here.
                 add_gallery_images(client, new_id, [img.id])
-
-            new_gallery = GalleryItem(
-                id=new_id,
-                title=metadata.title,
-                date=metadata.date,
-                details=metadata.details,
-                organized=False,
-                image_count=1,
-                rating100=metadata.rating100,
-                studio_id=metadata.studio_id,
-                cover_id=metadata.cover_image_id,
-                tag_ids=(settings.gallery_tag_id,),
-                performer_ids=metadata.performer_ids,
-            )
-            buckets[new_id] = _ClusterBucket(gallery=new_gallery, images=[img], is_new=True)
             matcher.add(new_id, img.details)
             created += 1
 
@@ -538,17 +510,46 @@ def _assign_images_to_clusters(
         for gallery_id, image_ids in pending_adds.items():
             add_gallery_images(client, gallery_id, image_ids)
 
-    updated = 0
-    for gallery_id in touched_buckets:
-        if _sync_gallery_fields(client, buckets[gallery_id], settings, dry_run=dry_run):
-            updated += 1
-
+    updated = _sync_touched_galleries(client, touched, settings, dry_run=dry_run)
     return {
         "evaluated": len(to_process),
         "joined": joined,
         "created": created,
         "updated": updated,
     }
+
+
+def _sync_touched_galleries(
+    client: StashClient,
+    gallery_ids: set[str],
+    settings: ClusterSettings,
+    *,
+    dry_run: bool,
+) -> int:
+    """Refresh the metadata of the galleries that gained an image.
+
+    Only the hooks call this, and they never run dry, so a dry run keeps previewing the
+    grouping without reading the members back.
+    """
+    if dry_run or not gallery_ids:
+        return 0
+    ids = sorted(gallery_ids)
+    galleries = {gallery.id: gallery for gallery in find_galleries_by_ids(client, ids)}
+    members: dict[str, list[ImageItem]] = {gallery_id: [] for gallery_id in ids}
+    for img in find_images_in_galleries(client, ids):
+        for gallery_id in img.gallery_ids:
+            if gallery_id in members:
+                members[gallery_id].append(img)
+
+    updated = 0
+    for gallery_id in ids:
+        gallery = galleries.get(gallery_id)
+        if gallery is None:
+            continue
+        bucket = _ClusterBucket(gallery=gallery, images=members[gallery_id])
+        if _sync_gallery_fields(client, bucket, settings, dry_run=dry_run):
+            updated += 1
+    return updated
 
 
 def _sync_all_managed_galleries(
@@ -648,27 +649,34 @@ def run_cluster(
 
     if entity_type == "image" and item_ids is not None:
         images = find_images_by_ids(client, item_ids)
-        managed = find_managed_galleries(client, tag_id)
+        anchors = find_gallery_anchors(client, tag_id)
 
         # An image that already belongs to a managed gallery changes that gallery, and an
         # image that lost the source tag has to leave it, so resync those galleries even
         # when the image is not a clustering candidate.
-        affected = [g for g in managed if any(g.id in img.gallery_ids for img in images)]
+        affected_ids = [
+            anchor.id for anchor in anchors if any(anchor.id in img.gallery_ids for img in images)
+        ]
         resynced, removed, destroyed = (
-            _sync_all_managed_galleries(client, affected, cluster_settings, dry_run=dry_run)
-            if affected
+            _sync_all_managed_galleries(
+                client,
+                find_galleries_by_ids(client, affected_ids),
+                cluster_settings,
+                dry_run=dry_run,
+            )
+            if affected_ids
             else (0, 0, 0)
         )
         # Stash fires no hook when images are removed from a gallery in the UI, so an empty
         # gallery can survive until something else touches it. Sweep those here.
-        destroyed += _cleanup_empty_galleries(client, managed, dry_run=dry_run)
+        destroyed += _cleanup_empty_galleries(client, anchors, dry_run=dry_run)
 
         candidates = select_candidates(images, source_tag_id)
         stats = (
             _assign_images_to_clusters(
                 client,
                 candidates,
-                managed,
+                anchors,
                 cluster_settings,
                 dry_run=dry_run,
             )

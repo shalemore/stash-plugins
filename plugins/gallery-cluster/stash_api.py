@@ -190,6 +190,22 @@ FIND_IMAGES = Operation[_FindImagesData]("""
     }
 """)
 
+FIND_GALLERY_ANCHORS = Operation[_FindGalleriesData]("""
+    query GalleryClusterGalleryAnchors(
+      $galleryFilter: GalleryFilterType,
+      $filter: FindFilterType
+    ) {
+      findGalleries(gallery_filter: $galleryFilter, filter: $filter) {
+        galleries {
+          id
+          details
+          organized
+          image_count
+        }
+      }
+    }
+""")
+
 FIND_GALLERIES = Operation[_FindGalleriesData]("""
     query GalleryClusterFindGalleries(
       $galleryFilter: GalleryFilterType,
@@ -293,6 +309,16 @@ class GalleryItem:
     cover_id: str | None
     tag_ids: tuple[str, ...]
     performer_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GalleryAnchor:
+    """A managed gallery as far as matching and empty cleanup need it."""
+
+    id: str
+    details: str
+    organized: bool
+    image_count: int
 
 
 @dataclass(frozen=True)
@@ -415,6 +441,25 @@ def find_images_in_galleries(client: StashClient, gallery_ids: list[str]) -> lis
             item = _to_image_item(raw)
             found[item.id] = item
     return list(found.values())
+
+
+def find_gallery_anchors(client: StashClient, tag_id: str) -> list[GalleryAnchor]:
+    data = client.execute(
+        FIND_GALLERY_ANCHORS,
+        {
+            "galleryFilter": {"tags": {"value": [tag_id], "modifier": "INCLUDES"}},
+            "filter": {"per_page": -1},
+        },
+    )
+    return [
+        GalleryAnchor(
+            id=raw["id"],
+            details=(raw["details"] or "").strip(),
+            organized=raw["organized"],
+            image_count=raw["image_count"],
+        )
+        for raw in data["findGalleries"]["galleries"]
+    ]
 
 
 def find_managed_galleries(client: StashClient, tag_id: str) -> list[GalleryItem]:

@@ -270,11 +270,13 @@ def test_assign_images_dry_run_creates_single_and_merges_similar():
     stats = cluster._assign_images_to_clusters(
         client=None,
         candidates=cluster.select_candidates([img1, img2, img3, locked], "99"),
-        managed_galleries=[],
+        anchors=[],
         settings=make_settings(),
         dry_run=True,
     )
-    assert stats == {"evaluated": 3, "joined": 1, "created": 2, "updated": 1}
+    # A dry run previews the grouping; the metadata of joined galleries needs their
+    # members, which only the real hook run reads back.
+    assert stats == {"evaluated": 3, "joined": 1, "created": 2, "updated": 0}
 
 
 def test_cluster_groups_ignores_existing_gallery_membership():
