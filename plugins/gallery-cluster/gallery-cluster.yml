@@ -1,6 +1,6 @@
 name: Gallery Cluster
 description: Group images with similar descriptions into galleries
-version: 0.1.0
+version: 0.2.0
 
 url: https://github.com/shalemore/stash-plugins
 
@@ -12,9 +12,9 @@ interface: raw
 errLog: info
 
 settings:
-  path_prefixes:
-    displayName: Path prefixes
-    description: Comma-separated path prefixes of images to group. Leave empty to skip all images.
+  source_tag:
+    displayName: Source tag
+    description: Tag name or ID. Only ungrouped images carrying this tag are grouped. Leave empty to skip all images.
     type: STRING
   gallery_tag:
     displayName: Gallery tag
@@ -22,12 +22,12 @@ settings:
     type: STRING
   similarity_threshold:
     displayName: Similarity threshold
-    description: Minimum description similarity (0 to 1) to join an existing gallery. Defaults to 0.85.
-    type: NUMBER
+    description: Minimum description similarity (0 to 1) to join an existing gallery. Empty or 0 uses 0.85.
+    type: STRING
 
 tasks:
   - name: Full Rebuild
-    description: Group matching ungrouped images and sync managed gallery titles, dates, covers, and empty galleries
+    description: Group tagged ungrouped images and sync managed gallery titles, dates, covers, and empty galleries
     defaultArgs:
       dry_run: false
   - name: Dry Run
@@ -37,14 +37,14 @@ tasks:
 
 hooks:
   - name: Image Create
-    description: Group a newly created image if it matches the configured path prefixes and has a description
+    description: Group a newly created image if it carries the source tag and has a description
     triggeredBy:
       - Image.Create.Post
     defaultArgs:
       dry_run: false
       entity_type: image
   - name: Image Update
-    description: Group an updated image after its description or metadata is saved
+    description: Group an updated image after its description, tags, or metadata are saved
     triggeredBy:
       - Image.Update.Post
     defaultArgs:

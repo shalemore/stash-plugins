@@ -14,7 +14,7 @@ from stash_api import (
     destroy_galleries,
     find_galleries_by_ids,
     find_images_by_ids,
-    find_images_by_prefix,
+    find_images_by_tag,
     find_images_in_galleries,
     find_managed_galleries,
     get_plugin_settings,
@@ -40,48 +40,43 @@ DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 @dataclass(frozen=True)
 class ClusterConfig:
-    path_prefixes: tuple[str, ...]
+    source_tag: str
     gallery_tag: str
     similarity_threshold: float
 
 
+def parse_threshold(value: object) -> float:
+    """Read the similarity threshold, treating an empty or non-positive value as the default.
+
+    Stash has no default for plugin settings, and `0` is never a meaningful threshold, so
+    both mean "use the default" instead of failing.
+    """
+    if value is None or value == "":
+        return DEFAULT_SIMILARITY_THRESHOLD
+    try:
+        parsed = float(value) if isinstance(value, int | float | str) else float(str(value))
+    except ValueError as exc:
+        raise ValueError(f"similarity_threshold must be a number; received: {value!r}") from exc
+    if parsed <= 0:
+        return DEFAULT_SIMILARITY_THRESHOLD
+    if parsed > 1:
+        raise ValueError(f"similarity_threshold must be in (0, 1]; received: {parsed}")
+    return parsed
+
+
 def parse_config(settings: dict[str, object]) -> ClusterConfig:
-    raw_prefixes = as_str(settings.get("path_prefixes")) or ""
-    prefixes = tuple(
-        part.strip()
-        for part in re.split(r"[,;\r\n]+", raw_prefixes)
-        if part.strip()
-    )
-    gallery_tag = (as_str(settings.get("gallery_tag")) or "").strip()
-
-    raw_threshold = settings.get("similarity_threshold")
-    threshold = DEFAULT_SIMILARITY_THRESHOLD
-    if raw_threshold is not None and raw_threshold != "":
-        try:
-            parsed = (
-                float(raw_threshold)
-                if isinstance(raw_threshold, int | float | str)
-                else float(str(raw_threshold))
-            )
-        except ValueError as exc:
-            raise ValueError(
-                f"similarity_threshold must be a number; received: {raw_threshold}"
-            ) from exc
-        if not 0.0 < parsed <= 1.0:
-            raise ValueError(
-                f"similarity_threshold must be in (0, 1]; received: {parsed}"
-            )
-        threshold = parsed
-
     return ClusterConfig(
-        path_prefixes=prefixes,
-        gallery_tag=gallery_tag,
-        similarity_threshold=threshold,
+        source_tag=(as_str(settings.get("source_tag")) or "").strip(),
+        gallery_tag=(as_str(settings.get("gallery_tag")) or "").strip(),
+        similarity_threshold=parse_threshold(settings.get("similarity_threshold")),
     )
 
 
-def matches_any_prefix(paths: tuple[str, ...], prefixes: tuple[str, ...]) -> bool:
-    return any(path.startswith(prefix) for path in paths for prefix in prefixes)
+def select_candidates(images: list[ImageItem], tag_id: str) -> list[ImageItem]:
+    """Keep ungrouped images that carry the source tag and have a description to match on."""
+    return [
+        img for img in images if tag_id in img.tag_ids and not img.organized and bool(img.details)
+    ]
 
 
 def image_sort_key(image: ImageItem) -> tuple[int, int, str, int]:
@@ -241,13 +236,7 @@ def _assign_images_to_clusters(
             matcher.add(gallery.id, gallery.details)
 
     to_process = sorted(
-        (
-            img
-            for img in candidates
-            if not img.organized
-            and bool(img.details)
-            and not any(gid in managed_ids for gid in img.gallery_ids)
-        ),
+        (img for img in candidates if not any(gid in managed_ids for gid in img.gallery_ids)),
         key=image_sort_key,
     )
 
@@ -365,15 +354,22 @@ def run_cluster(
     settings = get_plugin_settings(client)
     config = parse_config(settings)
 
-    if not config.path_prefixes or not config.gallery_tag:
-        message = (
-            "Skipped: configure both 'Path prefixes' and 'Gallery tag' in Plugin Settings first."
-        )
+    if not config.source_tag or not config.gallery_tag:
+        message = "Skipped: configure both 'Source tag' and 'Gallery tag' in Plugin Settings first."
         if entity_type is None:
             emit_warn(message)
         else:
             emit_info(message)
         return {"dry_run": dry_run, "skipped_unconfigured": True}
+
+    source_tag_id = resolve_tag_id(client, config.source_tag, create_missing=False)
+    if source_tag_id is None:
+        message = f"Skipped: source tag {config.source_tag!r} does not exist."
+        if entity_type is None:
+            emit_warn(message)
+        else:
+            emit_info(message)
+        return {"dry_run": dry_run, "missing_source_tag": config.source_tag}
 
     tag_id = resolve_tag_id(client, config.gallery_tag, create_missing=not dry_run)
     if tag_id is None:
@@ -385,41 +381,33 @@ def run_cluster(
         return {"dry_run": dry_run, "missing_tag": config.gallery_tag}
 
     if entity_type == "image" and item_ids is not None:
-        images = find_images_by_ids(client, item_ids)
-        matching = [
-            img
-            for img in images
-            if not img.organized
-            and bool(img.details)
-            and matches_any_prefix(img.paths, config.path_prefixes)
-        ]
-        if not matching:
-            return {"dry_run": dry_run, "evaluated": 0, "joined": 0, "created": 0}
+        images = select_candidates(find_images_by_ids(client, item_ids), source_tag_id)
+        if not images:
+            return {"dry_run": dry_run, "evaluated": 0, "joined": 0, "created": 0, "updated": 0}
 
         managed = find_managed_galleries(client, tag_id)
         stats = _assign_images_to_clusters(
             client,
-            matching,
+            images,
             managed,
             tag_id,
             config.similarity_threshold,
             dry_run=dry_run,
         )
         emit_info(
-            f"Gallery Cluster (image hook): evaluated={stats['evaluated']} "
-            f"joined={stats['joined']} created={stats['created']} updated={stats['updated']}"
+            f"Gallery Cluster: evaluated {stats['evaluated']} images, "
+            f"joined {stats['joined']} into existing galleries, "
+            f"created {stats['created']} new galleries, updated {stats['updated']} galleries."
         )
         return {"dry_run": dry_run, **stats}
 
     if entity_type == "gallery" and item_ids is not None:
-        galleries = [
-            g for g in find_galleries_by_ids(client, item_ids) if tag_id in g.tag_ids
-        ]
+        galleries = [g for g in find_galleries_by_ids(client, item_ids) if tag_id in g.tag_ids]
         if not galleries:
             return {"dry_run": dry_run, "updated": 0, "destroyed": 0}
         updated, destroyed = _sync_all_managed_galleries(client, galleries, dry_run=dry_run)
         emit_info(
-            f"Gallery Cluster (gallery hook): updated={updated} destroyed={destroyed}"
+            f"Gallery Cluster: updated {updated} galleries, destroyed {destroyed} empty galleries."
         )
         return {"dry_run": dry_run, "updated": updated, "destroyed": destroyed}
 
@@ -427,17 +415,14 @@ def run_cluster(
         managed = find_managed_galleries(client, tag_id)
         updated, destroyed = _sync_all_managed_galleries(client, managed, dry_run=dry_run)
         emit_info(
-            f"Gallery Cluster (destroy hook): updated={updated} destroyed={destroyed}"
+            f"Gallery Cluster: updated {updated} galleries, destroyed {destroyed} empty galleries."
         )
         return {"dry_run": dry_run, "updated": updated, "destroyed": destroyed}
 
     # Full Rebuild / Dry Run task
-    emit_info("Gallery Cluster: loading matching images and managed galleries...")
-    by_id: dict[str, ImageItem] = {}
-    for prefix in config.path_prefixes:
-        for img in find_images_by_prefix(client, prefix):
-            if matches_any_prefix(img.paths, config.path_prefixes):
-                by_id[img.id] = img
+    emit_info("Gallery Cluster: loading tagged images and managed galleries...")
+    candidates = select_candidates(find_images_by_tag(client, source_tag_id), source_tag_id)
+    matched_images = len(candidates)
 
     managed = find_managed_galleries(client, tag_id)
     cleaned_empty = _cleanup_empty_galleries(client, managed, dry_run=dry_run)
@@ -445,7 +430,7 @@ def run_cluster(
 
     assign_stats = _assign_images_to_clusters(
         client,
-        list(by_id.values()),
+        candidates,
         remaining_managed,
         tag_id,
         config.similarity_threshold,
@@ -465,12 +450,18 @@ def run_cluster(
     emit_progress(1.0)
     summary = {
         "dry_run": dry_run,
-        "matched_images": len(by_id),
+        "matched_images": matched_images,
         "evaluated": assign_stats["evaluated"],
         "joined": assign_stats["joined"],
         "created": assign_stats["created"],
         "updated": max(assign_stats["updated"], synced_updated),
         "destroyed": cleaned_empty + extra_destroyed,
     }
-    emit_info(f"Gallery Cluster summary: {summary}")
+    mode = "dry run" if dry_run else "rebuild"
+    emit_info(
+        f"Gallery Cluster {mode}: matched {summary['matched_images']} tagged images, "
+        f"evaluated {summary['evaluated']}, joined {summary['joined']} into existing galleries, "
+        f"created {summary['created']} new galleries, updated {summary['updated']} galleries, "
+        f"destroyed {summary['destroyed']} empty galleries."
+    )
     return summary

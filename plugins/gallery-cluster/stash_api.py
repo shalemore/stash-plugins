@@ -35,6 +35,7 @@ class RawImage(TypedDict):
     created_at: str
     visual_files: list[_VisualFile]
     galleries: list[_GalleryRef]
+    tags: list[_TagRef]
 
 
 class RawGallery(TypedDict):
@@ -156,6 +157,9 @@ FIND_IMAGES = Operation[_FindImagesData]("""
           galleries {
             id
           }
+          tags {
+            id
+          }
         }
       }
     }
@@ -232,6 +236,7 @@ class ImageItem:
     created_at: str
     paths: tuple[str, ...]
     gallery_ids: tuple[str, ...]
+    tag_ids: tuple[str, ...]
 
 
 @dataclass
@@ -258,6 +263,7 @@ def _to_image_item(raw: RawImage) -> ImageItem:
         created_at=raw["created_at"],
         paths=paths,
         gallery_ids=tuple(g["id"] for g in raw["galleries"]),
+        tag_ids=tuple(t["id"] for t in raw["tags"]),
     )
 
 
@@ -309,11 +315,11 @@ def find_images_by_ids(client: StashClient, image_ids: list[str]) -> list[ImageI
     return [_to_image_item(raw) for raw in data["findImages"]["images"]]
 
 
-def find_images_by_prefix(client: StashClient, prefix: str) -> list[ImageItem]:
+def find_images_by_tag(client: StashClient, tag_id: str) -> list[ImageItem]:
     data = client.execute(
         FIND_IMAGES,
         {
-            "imageFilter": {"path": {"value": prefix, "modifier": "INCLUDES"}},
+            "imageFilter": {"tags": {"value": [tag_id], "modifier": "INCLUDES"}},
             "filter": {"per_page": -1},
         },
     )

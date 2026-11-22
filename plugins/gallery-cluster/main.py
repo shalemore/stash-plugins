@@ -3,7 +3,7 @@
 from stash_plugin import HookContext, PluginInput, as_bool, as_list, as_str, emit_info, run_plugin
 
 RELEVANT_IMAGE_FIELDS = frozenset(
-    {"details", "title", "date", "code", "organized", "paths", "galleries"}
+    {"details", "title", "date", "code", "organized", "paths", "galleries", "tag_ids"}
 )
 RELEVANT_GALLERY_FIELDS = frozenset({"image_ids", "organized", "cover_image_id"})
 

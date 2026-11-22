@@ -43,6 +43,7 @@ def make_image(
     created_at: str = "2026-01-01T00:00:00Z",
     paths: tuple[str, ...] = ("/data/img/a.avif",),
     gallery_ids: tuple[str, ...] = (),
+    tag_ids: tuple[str, ...] = ("99",),
 ) -> object:
     return stash_api.ImageItem(
         id=image_id,
@@ -54,6 +55,7 @@ def make_image(
         created_at=created_at,
         paths=paths,
         gallery_ids=gallery_ids,
+        tag_ids=tag_ids,
     )
 
 
@@ -79,19 +81,34 @@ def test_description_matcher_exact_and_fuzzy():
     assert matcher.find_best("Completely unrelated landscape with mountains and snow.") is None
 
 
-def test_parse_config_defaults_and_validation():
-    cfg = cluster.parse_config({"path_prefixes": "/a/, /b/\n/c/", "gallery_tag": "Batches"})
-    assert cfg.path_prefixes == ("/a/", "/b/", "/c/")
+def test_parse_config_reads_tags_and_defaults_threshold():
+    cfg = cluster.parse_config({"source_tag": " Grouped ", "gallery_tag": "Batches"})
+    assert cfg.source_tag == "Grouped"
     assert cfg.gallery_tag == "Batches"
     assert cfg.similarity_threshold == cluster.DEFAULT_SIMILARITY_THRESHOLD
 
+    assert cluster.parse_config({"similarity_threshold": "0.9"}).similarity_threshold == 0.9
+    assert cluster.parse_config({"similarity_threshold": "1"}).similarity_threshold == 1.0
+
+    # Stash renders an unset setting as 0, so 0 must fall back to the default.
+    assert cluster.parse_config({"similarity_threshold": 0}).similarity_threshold == (
+        cluster.DEFAULT_SIMILARITY_THRESHOLD
+    )
+
     with pytest.raises(ValueError, match="similarity_threshold"):
         cluster.parse_config({"similarity_threshold": "1.5"})
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        cluster.parse_config({"similarity_threshold": "abc"})
 
 
-def test_matches_any_prefix():
-    assert cluster.matches_any_prefix(("/data/gen/2026/a.avif",), ("/data/gen/",))
-    assert not cluster.matches_any_prefix(("/data/other/a.avif",), ("/data/gen/",))
+def test_select_candidates_requires_source_tag_description_and_ungrouped():
+    tagged = make_image("1", details="A portrait under warm sunlight")
+    untagged = make_image("2", tag_ids=("7",))
+    organized = make_image("3", organized=True)
+    no_details = make_image("4", details="")
+
+    selected = cluster.select_candidates([tagged, untagged, organized, no_details], "99")
+    assert [img.id for img in selected] == ["1"]
 
 
 def test_derive_gallery_metadata_uses_earliest_title_and_latest_date():
@@ -148,7 +165,7 @@ def test_assign_images_dry_run_creates_single_and_merges_similar():
 
     stats = cluster._assign_images_to_clusters(
         client=None,
-        candidates=[img1, img2, img3, locked],
+        candidates=cluster.select_candidates([img1, img2, img3, locked], "99"),
         managed_galleries=[],
         tag_id="99",
         threshold=0.85,
