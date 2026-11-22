@@ -18,9 +18,10 @@ RELEVANT_IMAGE_FIELDS = frozenset(
         "rating100",
     }
 )
-RELEVANT_GALLERY_FIELDS = frozenset(
-    {"image_ids", "organized", "cover_image_id", "performer_ids", "studio_id", "rating100"}
-)
+# The plugin writes gallery title, date, details, performers, studio, and rating itself, so
+# those fields must not wake it again: every gallery update costs a plugin run, and a rebuild
+# touches thousands of galleries. Only membership and the manual lock need a resync.
+RELEVANT_GALLERY_FIELDS = frozenset({"image_ids", "organized", "cover_image_id"})
 
 
 def resolve_hook_item_ids(hook: HookContext) -> list[str]:

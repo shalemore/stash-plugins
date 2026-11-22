@@ -394,8 +394,9 @@ def _assign_images_to_clusters(
                     studio_id=metadata.studio_id,
                     rating100=metadata.rating100,
                 )
+                # Stash sets the cover of a gallery without one to the first added image, so
+                # nothing else is needed here.
                 add_gallery_images(client, new_id, [img.id])
-                set_gallery_cover(client, new_id, metadata.cover_image_id)
 
             new_gallery = GalleryItem(
                 id=new_id,
